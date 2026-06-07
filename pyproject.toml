@@ -8,6 +8,7 @@ dependencies = [
     "pydantic>=2.7,<3.0",
     "pydantic-settings>=2.3,<3.0",
     "ollama>=0.6.2",
+    "mcp==1.27.2",
 ]
 
 [project.optional-dependencies]

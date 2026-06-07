@@ -1,8 +1,8 @@
 # Brain
 
 Local-first agentic memory layer for agents. The project stores scoped user memories in
-SQLite with vector search, extracts atomic facts from conversations, and is being built in
-layers toward an MCP stdio server.
+SQLite with vector search, extracts atomic facts from conversations, reconciles them, and exposes
+the memory service as an MCP stdio server.
 
 ## Status
 
@@ -11,12 +11,12 @@ layers toward an MCP stdio server.
 | Layer 1: Storage + Retrieval | Complete | SQLite + sqlite-vec store, local embedder, scoped add/search/get/delete/update, Layer 1 demo |
 | Layer 2: Extraction + Naive Add | Complete | Ollama-backed fact extraction, fake LLM fixture path, always-add reconciler, MemoryService facade, Layer 2 demo |
 | Layer 3: Reconciliation | Complete | LLM-backed ADD/UPDATE/DELETE/NOOP reconciler, candidate thresholding, update-in-place path, Layer 3 demo |
-| Layer 4: MCP Server | Not started | Planned MCP tools over stdio |
+| Layer 4: MCP Server | Complete | `remember`, `recall`, and `forget` MCP tools over stdio |
 
 Current behavior: messages are extracted into atomic facts, scope-filtered similar memories are
 retrieved, and the active reconciler decides whether to add, update, delete, or skip each fact.
-The default factory now wires `LLMReconciler` with Ollama. MCP server, auth, and HTTP transport are
-not built yet.
+The default factory wires `LLMReconciler` with Ollama and the MCP server wraps that service over
+stdio. Auth and HTTP transport are not built.
 
 ## Architecture
 
@@ -37,7 +37,7 @@ filter by `user_id` and `namespace`.
 - Python 3.11+
 - `uv`
 - macOS/Linux with local SQLite extension support
-- Ollama for live Layer 2 extraction and Layer 3 reconciliation
+- Ollama for live Layer 2 extraction, Layer 3 reconciliation, and MCP `remember` calls
 
 Install `uv` on macOS:
 
@@ -137,7 +137,25 @@ ADD/UPDATE/NOOP behavior:
 uv run python scripts/demo_layer3.py --mode live
 ```
 
+MCP stdio server. This blocks on stdio for an MCP client to connect:
+
+```bash
+uv run python -m brain.mcp_server
+```
+
+The server exposes:
+
+- `remember(messages, user_id, agent_id=None, namespace="default")`
+- `recall(query, user_id, agent_id=None, namespace="default", limit=10)`
+- `forget(id, user_id, agent_id=None, namespace="default")`
+
 ## Tests
+
+Run the full test suite:
+
+```bash
+uv run pytest
+```
 
 Run deterministic Layer 2 tests:
 
@@ -155,6 +173,12 @@ Run non-live tests for completed layers:
 
 ```bash
 uv run pytest -m "not live" -k "not slow and not ollama" -v
+```
+
+Run Layer 4 MCP transport tests:
+
+```bash
+uv run pytest tests/test_mcp.py -v
 ```
 
 Run live Layer 2 Ollama smoke tests:
@@ -187,6 +211,7 @@ src/brain/
   extract.py         # Layer 2 fact extraction prompt/schema and Extractor
   llm.py             # LLMClient, OllamaLLMClient, FakeLLMClient
   memory.py          # MemoryService facade and build_memory factory
+  mcp_server.py      # Layer 4 MCP stdio server
   models.py          # shared Pydantic models and Reconciler contract
   reconcile.py       # AlwaysAddReconciler and LLMReconciler
   store/
@@ -203,6 +228,7 @@ tests/
   test_store.py      # Layer 1 tests
   test_extract.py    # Layer 2 tests
   test_reconcile.py  # Layer 3 tests
+  test_mcp.py        # Layer 4 MCP transport tests
   fixtures/          # recorded conversations and LLM responses
 ```
 
@@ -267,6 +293,24 @@ uv run python scripts/demo_layer3.py
 uv run python scripts/demo_layer3.py --mode live
 ```
 
+### Layer 4: MCP Server
+
+Implemented:
+
+- `mcp==1.27.2` dependency from the official MCP Python SDK.
+- `FastMCP("brain-memory")` stdio server.
+- Module-level `build_memory()` construction shared by all tools.
+- `remember`, `recall`, and `forget` tools with flat scope arguments.
+- In-process MCP tests covering remember/recall persistence across separate calls and forget.
+
+Verification:
+
+```bash
+uv run pytest tests/test_mcp.py -v
+uv run pytest
+uv run python -m brain.mcp_server
+```
+
 ## Notes
 
 - `ollama` is imported only in `src/brain/llm.py`.
@@ -275,3 +319,5 @@ uv run python scripts/demo_layer3.py --mode live
 - `content_hash` exists for future policy, but it is not a uniqueness constraint.
 - `id` and `target_id` are strings across store/facade boundaries.
 - `Scope` objects should be passed to store and service calls, not loose dictionaries.
+- MCP scope arguments are flat on the wire; handlers construct `Scope` internally.
+- The MCP server is stdio-only; no auth, HTTP, or SSE transport is configured.
