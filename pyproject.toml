@@ -22,4 +22,5 @@ asyncio_mode = "auto"
 markers = [
     "slow: marks tests that use local model downloads or longer-running checks",
     "ollama: marks tests that require a running local Ollama server",
+    "live: marks tests that call live local models or services",
 ]

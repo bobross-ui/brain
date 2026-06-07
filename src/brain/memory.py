@@ -10,9 +10,12 @@ from brain.models import (
     Scope,
     ScoredMemory,
 )
-from brain.reconcile import AlwaysAddReconciler
+from brain.reconcile import LLMReconciler
 from brain.store.base import MemoryStore
 from brain.store.sqlite import SQLiteMemoryStore, _apply_schema
+
+
+RECONCILE_SCORE_THRESHOLD = 0.3
 
 
 class MemoryService:
@@ -34,28 +37,36 @@ class MemoryService:
         candidates = await self._extractor.extract(messages)
         stored: list[Memory] = []
         for candidate in candidates:
-            similar = await self._store.search(
-                candidate.content,
-                scope,
-                limit=self._search_k,
-            )
-            action: MemoryAction = await self._reconciler.reconcile(
-                candidate,
-                similar,
-            )
-            if action.kind == MemoryActionKind.ADD:
-                memory = await self._store.add(
+            similar = [
+                scored
+                for scored in await self._store.search(
+                    candidate.content,
+                    scope,
+                    limit=self._search_k,
+                )
+                if scored.score >= RECONCILE_SCORE_THRESHOLD
+            ]
+            action: MemoryAction = await self._reconciler.reconcile(candidate, similar)
+            if action.kind == MemoryActionKind.ADD and action.content:
+                memory = await self._store.add(action.content, scope, action.metadata)
+                stored.append(memory)
+            elif (
+                action.kind == MemoryActionKind.UPDATE
+                and action.target_id
+                and action.content
+            ):
+                memory = await self._store.update(
+                    action.target_id,
                     action.content,
                     scope,
-                    action.metadata,
                 )
-                stored.append(memory)
-            elif action.kind == MemoryActionKind.UPDATE:
-                await self._store.update(action.target_id, action.content, scope)
-            elif action.kind == MemoryActionKind.DELETE:
+                if memory is not None:
+                    stored.append(memory)
+            elif action.kind == MemoryActionKind.DELETE and action.target_id:
                 await self._store.delete(action.target_id, scope)
             elif action.kind == MemoryActionKind.NOOP:
                 pass
+
         return stored
 
     async def search(
@@ -81,5 +92,5 @@ def build_memory() -> MemoryService:
     embedder = SentenceTransformerEmbedder(settings.brain_embedder_model)
     store = SQLiteMemoryStore(settings.brain_db_path, embedder)
     llm = OllamaLLMClient(settings.llm_model)
-    reconciler = AlwaysAddReconciler()
-    return MemoryService(store, llm, reconciler)
+    reconciler = LLMReconciler(llm)
+    return MemoryService(store, llm, reconciler, search_k=5)

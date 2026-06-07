@@ -1,0 +1,17 @@
+[
+  {
+    "call": "extract",
+    "response": {
+      "facts": ["User prefers sushi"]
+    }
+  },
+  {
+    "call": "reconcile",
+    "response": {
+      "action": "UPDATE",
+      "target_index": 0,
+      "content": "User prefers sushi",
+      "reason": "User changed food preference from pizza to sushi"
+    }
+  }
+]
