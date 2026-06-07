@@ -1,0 +1,23 @@
+[project]
+name = "brain"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlite-vec==0.1.9",
+    "sentence-transformers>=2.7,<3.0",
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.3,<3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "slow: marks tests that use local model downloads or longer-running checks",
+]
