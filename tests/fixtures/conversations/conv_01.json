@@ -1,0 +1,7 @@
+[
+  {"role": "user", "content": "Hey, I just moved to Berlin last month."},
+  {"role": "assistant", "content": "Nice! How are you finding it?"},
+  {"role": "user", "content": "I love it. I work as a software engineer and I cycle to work every day."},
+  {"role": "assistant", "content": "That sounds great. Any hobbies outside work?"},
+  {"role": "user", "content": "I play chess in the evenings and I am vegetarian."}
+]
