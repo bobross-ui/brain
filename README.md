@@ -15,8 +15,8 @@ the memory service as an MCP stdio server.
 
 Current behavior: messages are extracted into atomic facts, scope-filtered similar memories are
 retrieved, and the active reconciler decides whether to add, update, delete, or skip each fact.
-The default factory wires `LLMReconciler` with Ollama and the MCP server wraps that service over
-stdio. Auth and HTTP transport are not built.
+The default factory wires `LLMReconciler` with the configured LLM backend and the MCP server wraps
+that service over stdio. Auth and HTTP transport are not built.
 
 ## Architecture
 
@@ -24,7 +24,8 @@ The core seams are:
 
 - `Embedder`: converts text into vectors. Current implementation: `SentenceTransformerEmbedder`.
 - `MemoryStore`: async storage interface. Current implementation: `SQLiteMemoryStore`.
-- `LLMClient`: async JSON chat interface. Current implementation: `OllamaLLMClient`.
+- `LLMClient`: async JSON chat interface. Current implementations: `OllamaLLMClient` and
+  `DeepSeekLLMClient`.
 - `Reconciler`: decides what to do with extracted facts. Current implementations:
   `AlwaysAddReconciler` and `LLMReconciler`.
 - `MemoryService`: facade used by later layers: `add`, `search`, `get`, and `forget`.
@@ -37,7 +38,7 @@ filter by `user_id` and `namespace`.
 - Python 3.11+
 - `uv`
 - macOS/Linux with local SQLite extension support
-- Ollama for live Layer 2 extraction, Layer 3 reconciliation, and MCP `remember` calls
+- Ollama for the default local backend, live local tests, demos, and MCP `remember` calls
 
 Install `uv` on macOS:
 
@@ -64,11 +65,33 @@ Available settings:
 ```bash
 BRAIN_DB_PATH=./brain.db
 BRAIN_EMBEDDER_MODEL=sentence-transformers/all-MiniLM-L6-v2
-LLM_MODEL=qwen2.5:3b-instruct
 LLM_PROVIDER=ollama
+LLM_MODEL=qwen2.5:3b-instruct
+DEEPSEEK_API_KEY=
+DEEPSEEK_BASE_URL=https://api.deepseek.com
 ```
 
-No API keys are required.
+No API keys are required for the default local (Ollama) backend.
+
+## LLM Backends
+
+The `LLMClient` seam used for fact extraction and reconciliation has two implementations,
+selected by `LLM_PROVIDER`:
+
+- `ollama` (default): local, free, no API key. Uses `LLM_MODEL` (e.g. `qwen2.5:3b-instruct`).
+- `deepseek`: the DeepSeek API (OpenAI-compatible). Set:
+
+  ```bash
+  LLM_PROVIDER=deepseek
+  LLM_MODEL=deepseek-v4-pro
+  DEEPSEEK_API_KEY=sk-...
+  ```
+
+DeepSeek uses JSON output mode (`response_format={"type":"json_object"}`); the requested
+schema is injected into the prompt as guidance since DeepSeek does not enforce a JSON schema.
+Embeddings always stay local via `SentenceTransformerEmbedder` (DeepSeek has no embedding
+endpoint), so only extraction/reconciliation/answering move to the API. The provider factory
+is `brain.llm.build_llm_client(provider, model)`.
 
 ## Ollama Setup
 
@@ -202,6 +225,37 @@ run:
 uv run pytest tests/test_store.py -k "live_embedder" -v -s
 ```
 
+## Evaluation (LOCOMO)
+
+`scripts/eval_locomo.py` benchmarks Brain on the LOCOMO long-conversation dataset. It drives
+the public API in three phases: ingest each conversation session-by-session via
+`MemoryService.add()` (one `Scope(user_id=sample_id)` per conversation for isolation),
+retrieve per question via `MemoryService.search()`, then answer from only the retrieved
+memories. It reports a **recall@k** proxy (did the gold answer's content words land in the
+retrieved memories — separates retrieval from generation failures) alongside correctness, and
+writes per-question predictions to JSONL for offline grading.
+
+Get the dataset (`locomo10.json`) from the LOCOMO repo (`snap-research/locomo`); confirm its
+schema and category mapping there. Then:
+
+```bash
+# Quick run: 1 conversation, local memory + heuristic scoring (no API cost)
+uv run python scripts/eval_locomo.py --dataset path/to/locomo10.json
+
+# Full setup: local memory backend, DeepSeek as a stronger answerer + LLM judge
+LLM_PROVIDER=ollama uv run python scripts/eval_locomo.py \
+  --dataset path/to/locomo10.json \
+  --answerer-provider deepseek --answerer-model deepseek-v4-pro \
+  --judge deepseek --judge-model deepseek-v4-pro
+```
+
+The memory backend (extraction + reconciliation) follows `LLM_PROVIDER`/`LLM_MODEL`; the
+answerer and judge are chosen independently via flags, so you can isolate memory quality from
+the answerer LLM. Start with `--max-conversations 1` — a full LOCOMO conversation is hundreds
+of turns and ingests slowly through a local model. `LongMemEval` is the more rigorous follow-up
+benchmark (its knowledge-update and temporal-reasoning categories directly exercise the
+reconciler); this harness is the skeleton for that run.
+
 ## Project Layout
 
 ```text
@@ -209,7 +263,7 @@ src/brain/
   config.py          # pydantic-settings configuration
   embeddings.py      # Embedder interface, sentence-transformer embedder, fake embedder
   extract.py         # Layer 2 fact extraction prompt/schema and Extractor
-  llm.py             # LLMClient, OllamaLLMClient, FakeLLMClient
+  llm.py             # LLMClient, OllamaLLMClient, DeepSeekLLMClient, FakeLLMClient
   memory.py          # MemoryService facade and build_memory factory
   mcp_server.py      # Layer 4 MCP stdio server
   models.py          # shared Pydantic models and Reconciler contract
@@ -223,12 +277,15 @@ scripts/
   demo_layer1.py
   demo_layer2.py
   demo_layer3.py
+  eval_locomo.py
 
 tests/
   test_store.py      # Layer 1 tests
   test_extract.py    # Layer 2 tests
   test_reconcile.py  # Layer 3 tests
   test_mcp.py        # Layer 4 MCP transport tests
+  test_deepseek_llm.py
+  test_eval_locomo.py
   fixtures/          # recorded conversations and LLM responses
 ```
 

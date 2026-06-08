@@ -4,3 +4,7 @@
 __pycache__/
 *.py[cod]
 brain.db
+eval_results/
+graphify-out/
+data/locomo10.json
+working_docs/

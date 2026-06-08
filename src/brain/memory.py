@@ -1,7 +1,7 @@
 from brain.config import settings
 from brain.embeddings import SentenceTransformerEmbedder
 from brain.extract import Extractor
-from brain.llm import LLMClient, OllamaLLMClient
+from brain.llm import LLMClient, build_llm_client
 from brain.models import (
     Memory,
     MemoryAction,
@@ -85,12 +85,11 @@ class MemoryService:
 
 
 def build_memory() -> MemoryService:
-    if settings.llm_provider != "ollama":
-        raise ValueError(f"Unsupported LLM provider: {settings.llm_provider}")
-
+    # Build the LLM client first so an unsupported provider or missing DeepSeek
+    # key fails before any database side effects.
+    llm = build_llm_client(settings.llm_provider, settings.llm_model)
     _apply_schema(settings.brain_db_path)
     embedder = SentenceTransformerEmbedder(settings.brain_embedder_model)
     store = SQLiteMemoryStore(settings.brain_db_path, embedder)
-    llm = OllamaLLMClient(settings.llm_model)
     reconciler = LLMReconciler(llm)
     return MemoryService(store, llm, reconciler, search_k=5)
