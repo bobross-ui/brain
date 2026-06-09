@@ -22,7 +22,8 @@ that service over stdio. Auth and HTTP transport are not built.
 
 The core seams are:
 
-- `Embedder`: converts text into vectors. Current implementation: `SentenceTransformerEmbedder`.
+- `Embedder`: converts text into vectors and reports its `dim`, which sets the sqlite-vec
+  column width at schema-creation time. Current implementation: `SentenceTransformerEmbedder`.
 - `MemoryStore`: async storage interface. Current implementation: `SQLiteMemoryStore`.
 - `LLMClient`: async JSON chat interface. Current implementations: `OllamaLLMClient` and
   `DeepSeekLLMClient`.
@@ -83,7 +84,7 @@ selected by `LLM_PROVIDER`:
 
   ```bash
   LLM_PROVIDER=deepseek
-  LLM_MODEL=deepseek-v4-pro
+  LLM_MODEL=deepseek-v4-pro   # or deepseek-v4-flash for a lighter/cheaper model
   DEEPSEEK_API_KEY=sk-...
   ```
 
@@ -92,6 +93,22 @@ schema is injected into the prompt as guidance since DeepSeek does not enforce a
 Embeddings always stay local via `SentenceTransformerEmbedder` (DeepSeek has no embedding
 endpoint), so only extraction/reconciliation/answering move to the API. The provider factory
 is `brain.llm.build_llm_client(provider, model)`.
+
+## Embedding Model
+
+Embeddings are produced locally by `SentenceTransformerEmbedder` and selected with
+`BRAIN_EMBEDDER_MODEL` (default `sentence-transformers/all-MiniLM-L6-v2`, 384-dim). The
+sqlite-vec column width is derived from the embedder's `dim` and templated into `schema.sql`
+at schema-creation time, so any model works without code changes.
+
+Because `CREATE VIRTUAL TABLE` fixes the vector dimension at creation, switching to a
+**different-dimension** model requires rebuilding the database — delete `BRAIN_DB_PATH` and let
+it recreate. Same-dimension swaps only need a re-embed of existing rows.
+
+The store embeds queries and documents through the same call, so prefer **symmetric** models:
+`thenlper/gte-base` (768-dim) is a strong drop-in upgrade over the default. Asymmetric models
+that expect a query-only instruction prefix (`bge-*`, `mxbai-embed-large-v1`, `e5-*`) would
+need that prefix added at the embed sites to reach their full retrieval quality.
 
 ## Ollama Setup
 
@@ -179,6 +196,9 @@ Run the full test suite:
 ```bash
 uv run pytest
 ```
+
+Live-smoke tests carrying the `ollama` marker are pinned to the Ollama backend: they run only
+when `LLM_PROVIDER=ollama` and skip otherwise (e.g. on the DeepSeek backend).
 
 Run deterministic Layer 2 tests:
 

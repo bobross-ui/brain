@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -12,6 +13,11 @@ import sqlite_vec
 from brain.embeddings import Embedder
 from brain.models import Memory, Scope, ScoredMemory
 from brain.store.base import MemoryStore
+
+
+_MIGRATION_RE = re.compile(r"^(\d+)_.*\.sql$")
+_MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+_BASELINE_SCHEMA_VERSION = 1
 
 
 def _utc_now() -> str:
@@ -32,6 +38,7 @@ def _open_db(path: str) -> sqlite3.Connection:
         db_file.parent.mkdir(parents=True, exist_ok=True)
 
     db = sqlite3.connect(path, isolation_level=None)
+    db.execute("PRAGMA foreign_keys=ON")
     db.enable_load_extension(True)
     sqlite_vec.load(db)
     db.enable_load_extension(False)
@@ -39,15 +46,84 @@ def _open_db(path: str) -> sqlite3.Connection:
     return db
 
 
-def _schema_sql(dim: int) -> str:
-    template = (Path(__file__).parent / "schema.sql").read_text()
+def _render_migration(path: Path, dim: int) -> str:
+    template = path.read_text()
     return template.replace("__EMBEDDING_DIM__", str(dim))
+
+
+def _migration_files() -> list[tuple[int, Path]]:
+    migrations: list[tuple[int, Path]] = []
+    for path in _MIGRATIONS_DIR.iterdir():
+        match = _MIGRATION_RE.match(path.name)
+        if match:
+            migrations.append((int(match.group(1)), path))
+
+    migrations.sort(key=lambda migration: migration[0])
+    versions = [version for version, _ in migrations]
+    if len(versions) != len(set(versions)):
+        raise RuntimeError("Duplicate SQLite migration version")
+    return migrations
+
+
+def _latest_migration_version() -> int:
+    migrations = _migration_files()
+    return migrations[-1][0] if migrations else 0
+
+
+def _has_baseline_schema(db: sqlite3.Connection) -> bool:
+    rows = db.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name IN ('memories', 'vec_memories')
+        """
+    ).fetchall()
+    return {row["name"] for row in rows} == {"memories", "vec_memories"}
+
+
+def _current_schema_version(db: sqlite3.Connection) -> int:
+    version = int(db.execute("PRAGMA user_version").fetchone()[0])
+    if version == 0 and _has_baseline_schema(db):
+        # Existing Brain databases predate migrations. Their v1 tables already
+        # exist, so stamp them once and let future migrations run normally.
+        db.execute(f"PRAGMA user_version = {_BASELINE_SCHEMA_VERSION}")
+        return _BASELINE_SCHEMA_VERSION
+    return version
+
+
+def _apply_migration(
+    db: sqlite3.Connection,
+    *,
+    version: int,
+    path: Path,
+    dim: int,
+) -> None:
+    sql = _render_migration(path, dim)
+    try:
+        db.executescript(
+            f"""
+            BEGIN;
+            {sql}
+            PRAGMA user_version = {version};
+            COMMIT;
+            """
+        )
+    except sqlite3.Error:
+        try:
+            db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
 
 
 def _apply_schema(db_path: str, dim: int) -> None:
     db = _open_db(db_path)
     try:
-        db.executescript(_schema_sql(dim))
+        current_version = _current_schema_version(db)
+        for version, path in _migration_files():
+            if version > current_version:
+                _apply_migration(db, version=version, path=path, dim=dim)
+                current_version = version
     finally:
         db.close()
 
