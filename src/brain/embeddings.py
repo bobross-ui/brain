@@ -4,6 +4,12 @@ from abc import ABC, abstractmethod
 
 
 class Embedder(ABC):
+    @property
+    @abstractmethod
+    def dim(self) -> int:
+        """Dimensionality of vectors produced by ``embed``."""
+        ...
+
     @abstractmethod
     async def embed(self, text: str) -> list[float]:
         ...
@@ -19,6 +25,11 @@ class SentenceTransformerEmbedder(Embedder):
         from sentence_transformers import SentenceTransformer
 
         self._model = SentenceTransformer(model_name)
+        self._dim = self._model.get_sentence_embedding_dimension()
+
+    @property
+    def dim(self) -> int:
+        return self._dim
 
     async def embed(self, text: str) -> list[float]:
         vec = await asyncio.to_thread(
@@ -33,6 +44,10 @@ class FakeEmbedder(Embedder):
     """Deterministic, semantically meaningless D=384 embedder for tests."""
 
     D = 384
+
+    @property
+    def dim(self) -> int:
+        return self.D
 
     async def embed(self, text: str) -> list[float]:
         vec = [0.0] * self.D

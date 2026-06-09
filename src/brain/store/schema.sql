@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS idx_memories_user_ns ON memories (user_id, namespace);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
-    embedding float[384],
+    embedding float[__EMBEDDING_DIM__],
     user_id TEXT PARTITION KEY,
     namespace TEXT PARTITION KEY
 );

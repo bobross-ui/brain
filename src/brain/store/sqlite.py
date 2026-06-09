@@ -39,14 +39,15 @@ def _open_db(path: str) -> sqlite3.Connection:
     return db
 
 
-def _schema_sql() -> str:
-    return (Path(__file__).parent / "schema.sql").read_text()
+def _schema_sql(dim: int) -> str:
+    template = (Path(__file__).parent / "schema.sql").read_text()
+    return template.replace("__EMBEDDING_DIM__", str(dim))
 
 
-def _apply_schema(db_path: str) -> None:
+def _apply_schema(db_path: str, dim: int) -> None:
     db = _open_db(db_path)
     try:
-        db.executescript(_schema_sql())
+        db.executescript(_schema_sql(dim))
     finally:
         db.close()
 
@@ -72,7 +73,7 @@ class SQLiteMemoryStore(MemoryStore):
 
     @classmethod
     async def create(cls, db_path: str, embedder: Embedder) -> "SQLiteMemoryStore":
-        await asyncio.to_thread(_apply_schema, db_path)
+        await asyncio.to_thread(_apply_schema, db_path, embedder.dim)
         return cls(db_path, embedder)
 
     async def add(

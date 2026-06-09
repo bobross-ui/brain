@@ -88,8 +88,8 @@ def build_memory() -> MemoryService:
     # Build the LLM client first so an unsupported provider or missing DeepSeek
     # key fails before any database side effects.
     llm = build_llm_client(settings.llm_provider, settings.llm_model)
-    _apply_schema(settings.brain_db_path)
     embedder = SentenceTransformerEmbedder(settings.brain_embedder_model)
+    _apply_schema(settings.brain_db_path, embedder.dim)
     store = SQLiteMemoryStore(settings.brain_db_path, embedder)
     reconciler = LLMReconciler(llm)
     return MemoryService(store, llm, reconciler, search_k=5)
