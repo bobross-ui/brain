@@ -22,6 +22,11 @@ from brain.models import (
     SessionInput,
     StoredTurn,
 )
+from brain.retrieval import (
+    FilterSpec,
+    candidate_limit,
+    reciprocal_rank_fusion,
+)
 from brain.store.base import MemoryStore
 
 
@@ -53,6 +58,36 @@ def _fts5_query(text: str) -> str:
     return " OR ".join(f'"{token}"' for token in tokens)
 
 
+def _insert_fts_memory(
+    db: sqlite3.Connection,
+    rowid: int,
+    content: str,
+    subject: str | None,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO fts_memories(rowid, content, subject)
+        VALUES (?, ?, ?)
+        """,
+        (rowid, content, subject),
+    )
+
+
+def _delete_fts_memory(
+    db: sqlite3.Connection,
+    rowid: int,
+    content: str,
+    subject: str | None,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO fts_memories(fts_memories, rowid, content, subject)
+        VALUES ('delete', ?, ?, ?)
+        """,
+        (rowid, content, subject),
+    )
+
+
 def _open_db(path: str) -> sqlite3.Connection:
     db_file = Path(path)
     if db_file.parent != Path("."):
@@ -73,7 +108,7 @@ def _assert_fts5_available(db: sqlite3.Connection) -> None:
         db.execute("DROP TABLE temp._brain_fts5_check")
     except sqlite3.Error as exc:
         raise RuntimeError(
-            "SQLite FTS5 support is required for raw-turn retrieval"
+            "SQLite FTS5 support is required for hybrid retrieval"
         ) from exc
 
 
@@ -229,7 +264,11 @@ class SQLiteMemoryStore(MemoryStore):
         self._embedder = embedder
 
     @classmethod
-    async def create(cls, db_path: str, embedder: Embedder) -> "SQLiteMemoryStore":
+    async def create(
+        cls,
+        db_path: str,
+        embedder: Embedder,
+    ) -> "SQLiteMemoryStore":
         await asyncio.to_thread(_apply_schema, db_path, embedder.dim)
         return cls(db_path, embedder)
 
@@ -291,6 +330,7 @@ class SQLiteMemoryStore(MemoryStore):
                         scope.namespace,
                     ),
                 )
+                _insert_fts_memory(db, int(rowid), content, subject)
                 for turn_id in dict.fromkeys(internal_turn_ids or []):
                     db.execute(
                         """
@@ -480,7 +520,13 @@ class SQLiteMemoryStore(MemoryStore):
 
         completed_at = _utc_now()
 
-        def _delete_memory_row(db: sqlite3.Connection, rowid: int) -> None:
+        def _delete_memory_row(
+            db: sqlite3.Connection,
+            rowid: int,
+            content: str,
+            subject: str | None,
+        ) -> None:
+            _delete_fts_memory(db, rowid, content, subject)
             db.execute("DELETE FROM vec_memories WHERE rowid = ?", (rowid,))
             db.execute("DELETE FROM memories WHERE rowid = ?", (rowid,))
 
@@ -490,7 +536,7 @@ class SQLiteMemoryStore(MemoryStore):
                 db.execute("BEGIN")
                 partials = db.execute(
                     """
-                    SELECT rowid
+                    SELECT rowid, content, subject
                     FROM memories
                     WHERE user_id = ?
                       AND namespace = ?
@@ -499,7 +545,12 @@ class SQLiteMemoryStore(MemoryStore):
                     (scope.user_id, scope.namespace, session_id),
                 ).fetchall()
                 for partial in partials:
-                    _delete_memory_row(db, int(partial["rowid"]))
+                    _delete_memory_row(
+                        db,
+                        int(partial["rowid"]),
+                        partial["content"],
+                        partial["subject"],
+                    )
 
                 returned: list[dict[str, Any]] = []
                 for prepared in prepared_actions:
@@ -546,6 +597,12 @@ class SQLiteMemoryStore(MemoryStore):
                                 scope.namespace,
                             ),
                         )
+                        _insert_fts_memory(
+                            db,
+                            int(rowid),
+                            content,
+                            prepared["subject"],
+                        )
                         for turn_id in dict.fromkeys(
                             prepared["internal_turn_ids"] or []
                         ):
@@ -569,7 +626,7 @@ class SQLiteMemoryStore(MemoryStore):
                     elif kind == MemoryActionKind.UPDATE and prepared["target_id"] and content:
                         row = db.execute(
                             """
-                            SELECT rowid, metadata
+                            SELECT rowid, content, subject, metadata
                             FROM memories
                             WHERE id = ? AND user_id = ? AND namespace = ?
                             """,
@@ -580,6 +637,17 @@ class SQLiteMemoryStore(MemoryStore):
                         rowid = int(row["rowid"])
                         metadata = json.loads(row["metadata"])
                         metadata.update(prepared["metadata"])
+                        next_subject = (
+                            prepared["subject"]
+                            if prepared["subject"] is not None
+                            else row["subject"]
+                        )
+                        _delete_fts_memory(
+                            db,
+                            rowid,
+                            row["content"],
+                            row["subject"],
+                        )
                         db.execute(
                             """
                             UPDATE memories
@@ -603,6 +671,7 @@ class SQLiteMemoryStore(MemoryStore):
                                 rowid,
                             ),
                         )
+                        _insert_fts_memory(db, rowid, content, next_subject)
                         db.execute(
                             """
                             UPDATE vec_memories
@@ -642,14 +711,19 @@ class SQLiteMemoryStore(MemoryStore):
                     elif kind == MemoryActionKind.DELETE and prepared["target_id"]:
                         row = db.execute(
                             """
-                            SELECT rowid
+                            SELECT rowid, content, subject
                             FROM memories
                             WHERE id = ? AND user_id = ? AND namespace = ?
                             """,
                             (prepared["target_id"], scope.user_id, scope.namespace),
                         ).fetchone()
                         if row is not None:
-                            _delete_memory_row(db, int(row["rowid"]))
+                            _delete_memory_row(
+                                db,
+                                int(row["rowid"]),
+                                row["content"],
+                                row["subject"],
+                            )
 
                 db.execute(
                     """
@@ -678,65 +752,173 @@ class SQLiteMemoryStore(MemoryStore):
         query: str,
         scope: Scope,
         limit: int = 10,
+        *,
+        filters: dict | None = None,
+        mode: str = "hybrid",
     ) -> list[ScoredMemory]:
         if limit <= 0:
             return []
 
-        query_embedding = await self._embedder.embed(query)
+        if mode not in {"hybrid", "vector", "bm25"}:
+            raise ValueError(f"Unsupported search mode: {mode}")
 
-        def _work() -> list[tuple[dict[str, Any], float]]:
+        filter_spec = FilterSpec.from_dict(filters)
+        pool_limit = candidate_limit(
+            limit,
+            overfetch=(
+                filter_spec.active
+                or mode == "hybrid"
+            ),
+        )
+        query_embedding = None
+        if mode in {"hybrid", "vector"}:
+            query_embedding = await self._embedder.embed(query)
+        fts_query = _fts5_query(query) if mode in {"hybrid", "bm25"} else ""
+
+        def _work() -> dict[str, Any]:
             db = _open_db(self._db_path)
             try:
-                vector_rows = db.execute(
-                    """
-                    SELECT rowid, distance
-                    FROM vec_memories
-                    WHERE embedding MATCH ?
-                      AND k = ?
-                      AND user_id = ?
-                      AND namespace = ?
-                    ORDER BY distance
-                    """,
-                    (
-                        sqlite_vec.serialize_float32(query_embedding),
-                        limit,
-                        scope.user_id,
-                        scope.namespace,
-                    ),
-                ).fetchall()
+                vector_rows = []
+                if query_embedding is not None:
+                    vector_rows = db.execute(
+                        """
+                        SELECT rowid, distance
+                        FROM vec_memories
+                        WHERE embedding MATCH ?
+                          AND k = ?
+                          AND user_id = ?
+                          AND namespace = ?
+                        ORDER BY distance
+                        """,
+                        (
+                            sqlite_vec.serialize_float32(query_embedding),
+                            pool_limit,
+                            scope.user_id,
+                            scope.namespace,
+                        ),
+                    ).fetchall()
 
-                if not vector_rows:
-                    return []
+                bm25_rows = []
+                if fts_query:
+                    bm25_rows = db.execute(
+                        """
+                        SELECT fts_memories.rowid, bm25(fts_memories) AS bm25_score
+                        FROM fts_memories
+                        JOIN memories ON memories.rowid = fts_memories.rowid
+                        WHERE fts_memories MATCH ?
+                          AND memories.user_id = ?
+                          AND memories.namespace = ?
+                        ORDER BY bm25_score
+                        LIMIT ?
+                        """,
+                        (
+                            fts_query,
+                            scope.user_id,
+                            scope.namespace,
+                            pool_limit,
+                        ),
+                    ).fetchall()
 
-                distances = {
-                    int(row["rowid"]): float(row["distance"]) for row in vector_rows
-                }
-                placeholders = ",".join("?" for _ in distances)
+                candidate_rowids = list(
+                    dict.fromkeys(
+                        [
+                            int(row["rowid"])
+                            for row in [*vector_rows, *bm25_rows]
+                        ]
+                    )
+                )
+                if not candidate_rowids:
+                    return {
+                        "rows": {},
+                        "vector_ids": [],
+                        "bm25_ids": [],
+                        "distances": {},
+                        "bm25_scores": {},
+                    }
+
+                placeholders = ",".join("?" for _ in candidate_rowids)
+                subject_clause = ""
+                parameters: list[Any] = list(candidate_rowids)
+                if filter_spec.subject is not None:
+                    subject_clause = "AND memories.subject = ? COLLATE NOCASE"
+                    parameters.append(filter_spec.subject)
                 rows = db.execute(
                     f"""
                     SELECT memories.rowid, {_memory_select_columns("memories")}
                     FROM memories
                     WHERE memories.rowid IN ({placeholders})
+                      {subject_clause}
                     """,
-                    tuple(distances),
+                    tuple(parameters),
                 ).fetchall()
 
-                sorted_rows = sorted(
-                    rows,
-                    key=lambda row: distances[int(row["rowid"])],
-                )
-                return [
-                    (dict(row), distances[int(row["rowid"])])
-                    for row in sorted_rows
-                ]
+                rows_by_id = {
+                    str(int(row["rowid"])): dict(row)
+                    for row in rows
+                }
+                distances = {
+                    str(int(row["rowid"])): float(row["distance"])
+                    for row in vector_rows
+                }
+                bm25_scores = {
+                    str(int(row["rowid"])): float(row["bm25_score"])
+                    for row in bm25_rows
+                }
+                return {
+                    "rows": rows_by_id,
+                    "vector_ids": [
+                        str(int(row["rowid"]))
+                        for row in vector_rows
+                        if str(int(row["rowid"])) in rows_by_id
+                    ],
+                    "bm25_ids": [
+                        str(int(row["rowid"]))
+                        for row in bm25_rows
+                        if str(int(row["rowid"])) in rows_by_id
+                    ],
+                    "distances": distances,
+                    "bm25_scores": bm25_scores,
+                }
             finally:
                 db.close()
 
-        rows = await asyncio.to_thread(_work)
-        return [
-            ScoredMemory(memory=_row_to_memory(row), score=1.0 - distance)
-            for row, distance in rows
-        ]
+        candidates = await asyncio.to_thread(_work)
+        rows_by_id = candidates["rows"]
+        vector_ids = candidates["vector_ids"]
+        bm25_ids = candidates["bm25_ids"]
+
+        if mode == "vector":
+            ranked = [
+                ScoredMemory(
+                    memory=_row_to_memory(rows_by_id[rowid]),
+                    score=1.0 - candidates["distances"][rowid],
+                )
+                for rowid in vector_ids
+            ]
+        elif mode == "bm25":
+            ranked = [
+                ScoredMemory(
+                    memory=_row_to_memory(rows_by_id[rowid]),
+                    score=-candidates["bm25_scores"][rowid],
+                )
+                for rowid in bm25_ids
+            ]
+        else:
+            fused_scores = reciprocal_rank_fusion([vector_ids, bm25_ids])
+            fused_ids = sorted(
+                fused_scores,
+                key=lambda rowid: fused_scores[rowid],
+                reverse=True,
+            )
+            ranked = [
+                ScoredMemory(
+                    memory=_row_to_memory(rows_by_id[rowid]),
+                    score=fused_scores[rowid],
+                )
+                for rowid in fused_ids
+            ]
+
+        return ranked[:limit]
 
     async def get_turn(self, id: str, scope: Scope) -> StoredTurn | None:
         def _work() -> dict[str, Any] | None:
@@ -838,21 +1020,36 @@ class SQLiteMemoryStore(MemoryStore):
         def _work() -> bool:
             db = _open_db(self._db_path)
             try:
+                db.execute("BEGIN")
                 row = db.execute(
                     """
-                    SELECT rowid
+                    SELECT rowid, content, subject
                     FROM memories
                     WHERE id = ? AND user_id = ? AND namespace = ?
                     """,
                     (id, scope.user_id, scope.namespace),
                 ).fetchone()
                 if row is None:
+                    db.execute("ROLLBACK")
                     return False
 
                 rowid = int(row["rowid"])
+                _delete_fts_memory(
+                    db,
+                    rowid,
+                    row["content"],
+                    row["subject"],
+                )
                 db.execute("DELETE FROM vec_memories WHERE rowid = ?", (rowid,))
                 db.execute("DELETE FROM memories WHERE rowid = ?", (rowid,))
+                db.execute("COMMIT")
                 return True
+            except Exception:
+                try:
+                    db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
             finally:
                 db.close()
 
@@ -883,16 +1080,24 @@ class SQLiteMemoryStore(MemoryStore):
                 db.execute("BEGIN")
                 row = db.execute(
                     """
-                    SELECT rowid
+                    SELECT rowid, content, subject
                     FROM memories
                     WHERE id = ? AND user_id = ? AND namespace = ?
                     """,
                     (id, scope.user_id, scope.namespace),
                 ).fetchone()
                 if row is None:
+                    db.execute("ROLLBACK")
                     return None
 
                 rowid = int(row["rowid"])
+                next_subject = subject if subject is not None else row["subject"]
+                _delete_fts_memory(
+                    db,
+                    rowid,
+                    row["content"],
+                    row["subject"],
+                )
                 db.execute(
                     """
                     UPDATE memories
@@ -914,6 +1119,7 @@ class SQLiteMemoryStore(MemoryStore):
                         rowid,
                     ),
                 )
+                _insert_fts_memory(db, rowid, content, next_subject)
                 db.execute(
                     """
                     UPDATE vec_memories

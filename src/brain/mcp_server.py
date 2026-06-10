@@ -29,10 +29,35 @@ async def recall(
     agent_id: str | None = None,
     namespace: str = "default",
     limit: int = 10,
+    filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     scope = Scope(user_id=user_id, agent_id=agent_id, namespace=namespace)
-    results = await memory.search(query=query, scope=scope, limit=limit)
+    results = await memory.search(
+        query=query,
+        scope=scope,
+        limit=limit,
+        filters=filters,
+    )
     return [r.model_dump() for r in results]
+
+
+@mcp.tool()
+async def recall_evidence(
+    query: str,
+    user_id: str,
+    agent_id: str | None = None,
+    namespace: str = "default",
+    limit: int = 10,
+    filters: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    scope = Scope(user_id=user_id, agent_id=agent_id, namespace=namespace)
+    results = await memory.recall_evidence(
+        query=query,
+        scope=scope,
+        limit=limit,
+        filters=filters,
+    )
+    return [result.model_dump() for result in results]
 
 
 @mcp.tool()

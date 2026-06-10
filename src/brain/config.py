@@ -6,6 +6,7 @@ class Settings(BaseSettings):
 
     brain_db_path: str = "./brain.db"
     brain_embedder_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    brain_reranker_model: str | None = None
     llm_model: str = "qwen2.5:3b-instruct"
     llm_provider: str = "ollama"
     deepseek_api_key: str | None = None

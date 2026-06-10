@@ -23,8 +23,20 @@ class _RecordingService:
     async def search(self, query, scope, limit):
         return []
 
+    async def recall_evidence(self, query, scope, limit):
+        return []
+
     async def search_turns(self, query, scope, limit):
         return []
+
+
+class _AnswerLLM:
+    def __init__(self):
+        self.messages = []
+
+    async def chat_json(self, messages, schema, temperature=0.0):
+        self.messages = messages
+        return {"answer": "Berlin"}
 
 
 def _scored(content: str, source_turn_ids: list[str] | None = None):
@@ -87,6 +99,24 @@ def test_recall_at_k_proxy_accepts_turn_evidence():
     ]
 
     assert eval_locomo.recall_at_k("Berlin", retrieved) is True
+
+
+async def test_answer_question_consumes_retrieved_evidence():
+    llm = _AnswerLLM()
+    retrieved = [
+        RetrievedEvidence(
+            kind="turn",
+            content="Alice moved to Berlin.",
+            score=1.0,
+            turn_id="turn-1",
+            source_turn_ids=["D1:1"],
+        )
+    ]
+
+    answer = await eval_locomo.answer_question(llm, "Where did Alice move?", retrieved)
+
+    assert answer == "Berlin"
+    assert "Evidence:\n0. Alice moved to Berlin." in llm.messages[1]["content"]
 
 
 def test_evidence_recall_scores_full_partial_and_missing_evidence():

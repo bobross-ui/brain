@@ -33,6 +33,9 @@ class MemoryStore(ABC):
         query: str,
         scope: Scope,
         limit: int = 10,
+        *,
+        filters: dict | None = None,
+        mode: str = "hybrid",
     ) -> list[ScoredMemory]:
         ...
 

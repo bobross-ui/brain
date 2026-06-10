@@ -74,6 +74,7 @@ def test_apply_migrations_to_empty_db_sets_latest_version(tmp_path: Path) -> Non
             "sessions",
             "turns",
             "fts_turns",
+            "fts_memories",
             "memory_sources",
         }.issubset(_table_names(db))
         memory_columns = {
@@ -104,6 +105,7 @@ def test_apply_migrations_to_v1_db_is_idempotent(tmp_path: Path) -> None:
             "sessions",
             "turns",
             "fts_turns",
+            "fts_memories",
             "memory_sources",
         }.issubset(_table_names(db))
     finally:
@@ -162,6 +164,15 @@ def test_migrations_preserve_existing_v1_memory_rows(tmp_path: Path) -> None:
             ("memory-1",),
         ).fetchone()
         assert row["content"] == "Alice likes pasta."
+        fts_row = db.execute(
+            """
+            SELECT rowid
+            FROM fts_memories
+            WHERE fts_memories MATCH ?
+            """,
+            ('"pasta"',),
+        ).fetchone()
+        assert fts_row is not None
         assert db.execute("PRAGMA user_version").fetchone()[0] == (
             _latest_migration_version()
         )

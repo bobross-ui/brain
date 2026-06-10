@@ -84,6 +84,26 @@ async def test_remember_then_recall_round_trip(mcp_server: ModuleType):
         assert hit["memory"]["subject"] == "user"
         assert hit["memory"]["source_turn_ids"] == ["message-0"]
 
+        filtered_result = await client.call_tool(
+            "recall",
+            {
+                "query": "outdoor activities",
+                "user_id": "test-user",
+                "filters": {"subject": "someone-else"},
+            },
+        )
+        assert filtered_result.structuredContent["result"] == []
+
+        evidence_result = await client.call_tool(
+            "recall_evidence",
+            {
+                "query": "hiking mountains",
+                "user_id": "test-user",
+            },
+        )
+        evidence = evidence_result.structuredContent["result"]
+        assert {item["kind"] for item in evidence} == {"memory", "turn"}
+
 
 async def test_forget(mcp_server: ModuleType):
     async with create_connected_server_and_client_session(

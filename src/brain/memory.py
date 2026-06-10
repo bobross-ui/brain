@@ -20,6 +20,13 @@ from brain.models import (
     Turn,
 )
 from brain.reconcile import LLMReconciler
+from brain.retrieval import (
+    CrossEncoderReranker,
+    Reranker,
+    candidate_limit,
+    reciprocal_rank_fusion,
+    rerank,
+)
 from brain.store.base import MemoryStore
 from brain.store.sqlite import SQLiteMemoryStore, _apply_schema
 
@@ -35,11 +42,13 @@ class MemoryService:
         reconciler: Reconciler,
         *,
         search_k: int = 5,
+        reranker: Reranker | None = None,
     ):
         self._store = store
         self._llm = llm
         self._reconciler = reconciler
         self._search_k = search_k
+        self._reranker = reranker
         self._extractor = Extractor(llm)
 
     async def add(
@@ -98,6 +107,7 @@ class MemoryService:
                     candidate.content,
                     scope,
                     limit=self._search_k,
+                    mode="vector",
                 )
                 if scored.score >= RECONCILE_SCORE_THRESHOLD
             ]
@@ -258,8 +268,115 @@ class MemoryService:
         query: str,
         scope: Scope,
         limit: int = 10,
+        *,
+        filters: dict | None = None,
+        mode: str = "hybrid",
     ) -> list[ScoredMemory]:
-        return await self._store.search(query, scope, limit)
+        if limit <= 0:
+            return []
+
+        store_limit = candidate_limit(
+            limit,
+            overfetch=self._reranker is not None,
+        )
+        results = await self._store.search(
+            query,
+            scope,
+            store_limit,
+            filters=filters,
+            mode=mode,
+        )
+        reranked = await rerank(
+            query,
+            results,
+            [item.memory.content for item in results],
+            self._reranker,
+        )
+        if reranked is None:
+            return results[:limit]
+        return [
+            ScoredMemory(memory=item.memory, score=score)
+            for item, score in reranked[:limit]
+        ]
+
+    async def recall_evidence(
+        self,
+        query: str,
+        scope: Scope,
+        limit: int = 10,
+        *,
+        filters: dict | None = None,
+    ) -> list[RetrievedEvidence]:
+        if limit <= 0:
+            return []
+
+        pool_limit = candidate_limit(limit, overfetch=True)
+        memory_hits = await self._store.search(
+            query,
+            scope,
+            pool_limit,
+            filters=filters,
+            mode="hybrid",
+        )
+        turn_hits = await self._store.search_turns(query, scope, pool_limit)
+        memory_evidence = [
+            RetrievedEvidence(
+                kind="memory",
+                content=hit.memory.content,
+                score=hit.score,
+                memory_id=hit.memory.id,
+                source_turn_ids=hit.memory.source_turn_ids,
+                source_session_id=hit.memory.source_session_id,
+                observed_at=hit.memory.observed_at,
+            )
+            for hit in memory_hits
+        ]
+        evidence_by_id = {
+            **{
+                f"memory:{hit.memory_id}": hit
+                for hit in memory_evidence
+                if hit.memory_id is not None
+            },
+            **{
+                f"turn:{hit.turn_id}": hit
+                for hit in turn_hits
+                if hit.turn_id is not None
+            },
+        }
+        memory_ids = [
+            f"memory:{hit.memory_id}"
+            for hit in memory_evidence
+            if hit.memory_id is not None
+        ]
+        turn_ids = [
+            f"turn:{hit.turn_id}"
+            for hit in turn_hits
+            if hit.turn_id is not None
+        ]
+        fused_scores = reciprocal_rank_fusion([memory_ids, turn_ids])
+        fused_ids = sorted(
+            fused_scores,
+            key=lambda item_id: fused_scores[item_id],
+            reverse=True,
+        )
+        fused = [
+            evidence_by_id[item_id].model_copy(
+                update={"score": fused_scores[item_id]}
+            )
+            for item_id in fused_ids
+        ]
+        reranked = await rerank(
+            query,
+            fused,
+            [item.content for item in fused],
+            self._reranker,
+        )
+        if reranked is None:
+            return fused[:limit]
+        return [
+            item.model_copy(update={"score": score})
+            for item, score in reranked[:limit]
+        ]
 
     async def search_turns(
         self,
@@ -284,4 +401,15 @@ def build_memory() -> MemoryService:
     _apply_schema(settings.brain_db_path, embedder.dim)
     store = SQLiteMemoryStore(settings.brain_db_path, embedder)
     reconciler = LLMReconciler(llm)
-    return MemoryService(store, llm, reconciler, search_k=5)
+    reranker = (
+        CrossEncoderReranker(settings.brain_reranker_model)
+        if settings.brain_reranker_model
+        else None
+    )
+    return MemoryService(
+        store,
+        llm,
+        reconciler,
+        search_k=5,
+        reranker=reranker,
+    )

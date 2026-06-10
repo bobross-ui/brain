@@ -5,9 +5,10 @@ Three phases, all driving Brain's public API:
   1. Ingest   - replay each conversation session-by-session into MemoryService.ingest_session(),
                 using one Scope(user_id=sample_id) per conversation for isolation
                 (search filters on user_id + namespace, not agent_id).
-  2. Retrieve - for each question, either MemoryService.search(question, scope, limit=k)
-                over distilled memories or MemoryService.search_turns(...) over raw turns.
-                The raw-turn mode reports retrieval recall only and skips answer/judge.
+  2. Retrieve - for each question, either MemoryService.recall_evidence(...)
+                over fused distilled memories + raw turns, or
+                MemoryService.search_turns(...) over raw turns only. The raw-turn mode
+                reports retrieval recall only and skips answer/judge.
   3. Score    - true evidence recall from gold/retrieved dia_ids, the previous
                 answer-token recall@k proxy for comparison, and correctness via an
                 optional LLM judge (falls back to a token-overlap heuristic).
@@ -73,8 +74,8 @@ ANSWER_SCHEMA = {
     "required": ["answer"],
 }
 ANSWER_SYSTEM = (
-    "You answer questions using ONLY the memories provided about the speakers. "
-    "If the memories do not contain enough information to answer, reply with exactly: "
+    "You answer questions using ONLY the evidence provided about the speakers. "
+    "If the evidence does not contain enough information to answer, reply with exactly: "
     "No information available. Keep the answer short and factual."
 )
 
@@ -215,16 +216,16 @@ async def ingest_conversation(
 async def answer_question(
     llm: LLMClient,
     question: str,
-    retrieved: list[ScoredMemory],
+    retrieved: list[RetrievedEvidence],
 ) -> str:
-    memories = "\n".join(
-        f"{index}. {scored.memory.content}" for index, scored in enumerate(retrieved)
-    ) or "(no memories retrieved)"
+    evidence = "\n".join(
+        f"{index}. {item.content}" for index, item in enumerate(retrieved)
+    ) or "(no evidence retrieved)"
     messages = [
         {"role": "system", "content": ANSWER_SYSTEM},
         {
             "role": "user",
-            "content": f"Memories:\n{memories}\n\nQuestion: {question}",
+            "content": f"Evidence:\n{evidence}\n\nQuestion: {question}",
         },
     ]
     result = await llm.chat_json(messages, ANSWER_SCHEMA, temperature=0.0)
@@ -492,7 +493,11 @@ async def run(args: argparse.Namespace) -> None:
                         }
                     )
                 else:
-                    retrieved = await service.search(question, scope, limit=args.k)
+                    retrieved = await service.recall_evidence(
+                        question,
+                        scope,
+                        limit=args.k,
+                    )
                     prediction = await answer_question(answerer, question, retrieved)
 
                     if judge is not None:
@@ -507,7 +512,7 @@ async def run(args: argparse.Namespace) -> None:
                             "question": question,
                             "gold": gold,
                             "prediction": prediction,
-                            "retrieved": [scored.memory.content for scored in retrieved],
+                            "retrieved": [hit.content for hit in retrieved],
                             **_evidence_fields(gold_evidence, retrieved),
                             "recall_hit": recall_at_k(gold, retrieved),
                             "correct": correct,

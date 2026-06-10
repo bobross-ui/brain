@@ -1,24 +1,25 @@
 # Brain
 
-Local-first agentic memory layer for agents. The project stores scoped user memories in
-SQLite with vector search, extracts atomic facts from conversations, reconciles them, and exposes
-the memory service as an MCP stdio server.
+Local-first agentic memory layer for agents. The project stores scoped memories and raw conversation
+turns in SQLite, retrieves them with hybrid vector + FTS5/BM25 search, extracts and reconciles atomic
+facts, and exposes the memory service as an MCP stdio server.
 
 ## Status
 
 | Layer | Status | What works now |
 | --- | --- | --- |
-| Layer 1: Storage + Retrieval | Complete | SQLite + sqlite-vec memories, append-only raw sessions/turns, FTS5/BM25 turn retrieval, scoped CRUD |
+| Layer 1: Storage + Retrieval | Complete | SQLite + sqlite-vec memories, append-only raw sessions/turns, hybrid vector + FTS5/BM25 retrieval, RRF fusion, subject filters, scoped CRUD |
 | Layer 2: Extraction + Naive Add | Complete | Ollama-backed fact extraction, fake LLM fixture path, always-add reconciler, MemoryService facade, Layer 2 demo |
 | Layer 3: Reconciliation | Complete | LLM-backed ADD/UPDATE/DELETE/NOOP reconciler, candidate thresholding, update-in-place path, Layer 3 demo |
-| Layer 4: MCP Server | Complete | `remember`, `recall`, and `forget` MCP tools over stdio |
+| Layer 4: MCP Server | Complete | `remember`, `recall`, `recall_evidence`, and `forget` MCP tools over stdio |
 
 Current behavior: raw sessions and turns are stored before extraction. Messages are then extracted
-into atomic facts, scope-filtered similar memories are retrieved, and the active reconciler decides
-whether to add, update, delete, or skip each fact. Session ingestion is idempotent and retry-safe;
-raw turns are searchable through SQLite FTS5/BM25. The default factory wires `LLMReconciler` with
-the configured LLM backend and the MCP server wraps that service over stdio. Auth and HTTP transport
-are not built.
+into atomic facts, vector-only similar memories are retrieved for reconciliation, and the active
+reconciler decides whether to add, update, delete, or skip each fact. User recall uses reciprocal
+rank fusion (RRF) over sqlite-vec and memory FTS5/BM25 candidates. The unified evidence path fuses
+those memory hits with raw-turn BM25 hits for answering and evaluation. Session ingestion is
+idempotent and retry-safe. The default factory wires `LLMReconciler` with the configured LLM
+backend, and the MCP server wraps that service over stdio. Auth and HTTP transport are not built.
 
 ## Architecture
 
@@ -32,7 +33,7 @@ The core seams are:
 - `Reconciler`: decides what to do with extracted facts. Current implementations:
   `AlwaysAddReconciler` and `LLMReconciler`.
 - `MemoryService`: facade used by later layers: `add`, `ingest_session`, `search`,
-  `search_turns`, `get`, and `forget`.
+  `recall_evidence`, `search_turns`, `get`, and `forget`.
 
 Memory scope is always explicit through `Scope(user_id, agent_id, namespace)`. Search and read paths
 filter by `user_id` and `namespace`.
@@ -69,6 +70,7 @@ Available settings:
 ```bash
 BRAIN_DB_PATH=./brain.db
 BRAIN_EMBEDDER_MODEL=sentence-transformers/all-MiniLM-L6-v2
+BRAIN_RERANKER_MODEL=
 LLM_PROVIDER=ollama
 LLM_MODEL=qwen2.5:3b-instruct
 DEEPSEEK_API_KEY=
@@ -76,6 +78,10 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 ```
 
 No API keys are required for the default local (Ollama) backend.
+
+`BRAIN_RERANKER_MODEL` is optional and disabled by default. Set it to a local
+sentence-transformers cross-encoder model to rerank the fused candidate pool. The model is loaded
+on first use and may be downloaded by sentence-transformers.
 
 ## LLM Backends
 
@@ -189,8 +195,12 @@ uv run python -m brain.mcp_server
 The server exposes:
 
 - `remember(messages, user_id, agent_id=None, namespace="default")`
-- `recall(query, user_id, agent_id=None, namespace="default", limit=10)`
+- `recall(query, user_id, agent_id=None, namespace="default", limit=10, filters=None)`
+- `recall_evidence(query, user_id, agent_id=None, namespace="default", limit=10, filters=None)`
 - `forget(id, user_id, agent_id=None, namespace="default")`
+
+At this phase, `filters` supports `{"subject": "Caroline"}`. `recall` preserves the existing
+`ScoredMemory` response shape; `recall_evidence` returns unified memory and raw-turn evidence.
 
 ## Tests
 
@@ -253,12 +263,13 @@ uv run pytest tests/test_store.py -k "live_embedder" -v -s
 `scripts/eval_locomo.py` benchmarks Brain on the LOCOMO long-conversation dataset. It ingests each
 conversation session-by-session via `MemoryService.ingest_session()` while preserving session IDs,
 turn IDs, speakers, and dates. With `--retrieve-from memories`, it retrieves via
-`MemoryService.search()`, answers from the retrieved memories, and optionally judges correctness.
+`MemoryService.recall_evidence()`, fusing hybrid memory hits with raw-turn hits, answers from the
+unified evidence, and optionally judges correctness.
 With `--retrieve-from turns`, it retrieves raw turns through FTS5/BM25 and reports retrieval recall
-only; answer generation and judge scoring are intentionally deferred until the unified evidence
-answer path is implemented.
+only.
 
-Both modes report a **recall@k** token-overlap proxy and write per-question records to JSONL.
+Both modes report true evidence-ID recall when the dataset supplies gold turn IDs, plus the original
+token-overlap recall proxy, and write per-question records to JSONL.
 
 Get the dataset (`locomo10.json`) from the LOCOMO repo (`snap-research/locomo`); confirm its
 schema and category mapping there. Then:
@@ -280,15 +291,27 @@ LLM_PROVIDER=ollama uv run python scripts/eval_locomo.py \
   --judge deepseek --judge-model deepseek-v4-pro
 ```
 
-The memory backend (extraction + reconciliation) follows `LLM_PROVIDER`/`LLM_MODEL`; the
-answerer and judge are chosen independently via flags, so you can isolate memory quality from
-the answerer LLM. Raw-turn mode still runs extraction during shared ingestion, so it is not yet a
-fast retrieval-only data load. Start with `--max-conversations 1` — a full LOCOMO conversation is
-hundreds of turns and ingests slowly.
+The memory backend (extraction + reconciliation) follows `LLM_PROVIDER`/`LLM_MODEL`; the answerer
+and judge are chosen independently via flags, so you can isolate memory quality from the answerer
+LLM. Existing completed session databases can be reused for retrieval experiments because
+re-ingestion skips extraction. Start with `--max-conversations 1`; a fresh full LOCOMO conversation
+is hundreds of turns and ingests slowly.
 
-Phase 1 baseline on the first conversation (`conv-26`, 199 questions, `k=10`) reached **0.349
-recall@10** overall with raw-turn BM25. This is the harness's token-overlap proxy, not evidence-ID
-recall or answer accuracy.
+### Conv-26 Phase 4 Result
+
+The Phase 4 run reused the completed Phase 3 database for `conv-26`, applied migration 4, and
+evaluated all 199 questions at `k=10`. Retrieval used hybrid memories plus raw turns; answers used
+`deepseek-v4-pro`, with no separate LLM judge.
+
+| Metric | Prior Phase 3 artifact | Phase 4 | Change |
+| --- | ---: | ---: | ---: |
+| Evidence recall | 0.516 | **0.700** | **+0.183** |
+| Evidence hit rate | 0.558 | **0.736** | **+0.178** |
+| Token-overlap recall proxy | 0.349 | **0.472** | **+0.123** |
+
+Phase 4 evidence recall by category was 0.787 adversarial, 0.260 multi-hop, 0.318 open-domain,
+0.786 single-hop, and 0.919 temporal. The reported answer accuracy was 0.231 using the harness's
+token-overlap heuristic; it is not an LLM-judged accuracy result.
 
 `LongMemEval` is the more rigorous follow-up benchmark (its knowledge-update and temporal-reasoning
 categories directly exercise the reconciler); this harness is the skeleton for that run.
@@ -305,6 +328,7 @@ src/brain/
   mcp_server.py      # Layer 4 MCP stdio server
   models.py          # shared Pydantic models and Reconciler contract
   reconcile.py       # AlwaysAddReconciler and LLMReconciler
+  retrieval.py       # filters, RRF fusion, overfetch settings, optional reranker
   store/
     base.py          # MemoryStore interface
     migrations/      # ordered SQLite schema migrations
@@ -320,6 +344,7 @@ tests/
   test_store.py      # memory store tests
   test_ingest.py     # raw session/turn ingestion and retrieval tests
   test_migrations.py # schema migration tests
+  test_retrieval.py  # hybrid retrieval, filters, FTS sync, fusion, reranker tests
   test_extract.py    # Layer 2 tests
   test_reconcile.py  # Layer 3 tests
   test_mcp.py        # Layer 4 MCP transport tests
@@ -339,6 +364,11 @@ Implemented:
 - Append-only sessions and raw turns preserving source IDs, speakers, and timestamps.
 - Idempotent, retry-safe session ingestion with atomic memory completion.
 - FTS5/BM25 raw-turn retrieval.
+- FTS5/BM25 memory retrieval synchronized on add, update, and delete.
+- RRF fusion over vector and BM25 memory rankings.
+- Subject filters with pre-filter overfetch for top-k correctness.
+- Unified memory + raw-turn evidence retrieval.
+- Optional local cross-encoder reranking.
 - Async `MemoryStore` interface.
 - `SQLiteMemoryStore` with memory CRUD plus session ingestion, turn lookup, and turn search.
 - `SentenceTransformerEmbedder` and deterministic `FakeEmbedder`.
@@ -401,7 +431,8 @@ Implemented:
 - `mcp==1.27.2` dependency from the official MCP Python SDK.
 - `FastMCP("brain-memory")` stdio server.
 - Module-level `build_memory()` construction shared by all tools.
-- `remember`, `recall`, and `forget` tools with flat scope arguments.
+- `remember`, `recall`, `recall_evidence`, and `forget` tools with flat scope arguments.
+- Optional subject filters on `recall` and `recall_evidence`.
 - In-process MCP tests covering remember/recall persistence across separate calls and forget.
 
 Verification:
