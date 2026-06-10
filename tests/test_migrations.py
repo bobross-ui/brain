@@ -68,7 +68,9 @@ def test_apply_migrations_to_empty_db_sets_latest_version(tmp_path: Path) -> Non
         assert db.execute("PRAGMA user_version").fetchone()[0] == (
             _latest_migration_version()
         )
-        assert {"memories", "vec_memories"}.issubset(_table_names(db))
+        assert {"memories", "vec_memories", "sessions", "turns", "fts_turns"}.issubset(
+            _table_names(db)
+        )
     finally:
         db.close()
 
@@ -85,7 +87,9 @@ def test_apply_migrations_to_v1_db_is_idempotent(tmp_path: Path) -> None:
         assert db.execute("PRAGMA user_version").fetchone()[0] == (
             _latest_migration_version()
         )
-        assert {"memories", "vec_memories"}.issubset(_table_names(db))
+        assert {"memories", "vec_memories", "sessions", "turns", "fts_turns"}.issubset(
+            _table_names(db)
+        )
     finally:
         db.close()
 

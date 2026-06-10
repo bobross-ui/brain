@@ -2,11 +2,12 @@
 
 Three phases, all driving Brain's public API:
 
-  1. Ingest   - replay each conversation session-by-session into MemoryService.add(),
+  1. Ingest   - replay each conversation session-by-session into MemoryService.ingest_session(),
                 using one Scope(user_id=sample_id) per conversation for isolation
                 (search filters on user_id + namespace, not agent_id).
-  2. Retrieve - for each question, MemoryService.search(question, scope, limit=k),
-                then ask a (pluggable) answerer LLM to answer from ONLY those memories.
+  2. Retrieve - for each question, either MemoryService.search(question, scope, limit=k)
+                over distilled memories or MemoryService.search_turns(...) over raw turns.
+                The raw-turn mode reports retrieval recall only and skips answer/judge.
   3. Score    - recall@k proxy (did the gold answer's content words land in the
                 retrieved memories?) to separate retrieval from generation, plus
                 correctness via an optional LLM judge (falls back to a token-overlap
@@ -42,7 +43,7 @@ from pathlib import Path
 from brain.config import settings
 from brain.llm import LLMClient, build_llm_client
 from brain.memory import build_memory
-from brain.models import Scope, ScoredMemory
+from brain.models import RetrievedEvidence, Scope, ScoredMemory, SessionInput, Turn
 
 
 # Best-effort; confirm against the LOCOMO dataset/repo before citing per-category numbers.
@@ -164,19 +165,38 @@ async def ingest_conversation(
     sessions_ingested = 0
     for key in keys:
         date_time = conversation.get(f"{key}_date_time")
-        messages: list[dict] = []
-        if date_time:
-            messages.append(
-                {"role": "system", "content": f"[Conversation session dated {date_time}]"}
-            )
+        turns: list[Turn] = []
         for turn in conversation[key]:
             speaker = turn.get("speaker") or turn.get("role") or "user"
             text = turn.get("text") or turn.get("content") or ""
             if text:
-                messages.append({"role": str(speaker), "content": str(text)})
+                source_turn_id = turn.get("dia_id") or turn.get("source_turn_id")
+                turns.append(
+                    Turn(
+                        speaker=str(speaker),
+                        text=str(text),
+                        source_turn_id=str(source_turn_id)
+                        if source_turn_id is not None
+                        else None,
+                        observed_at=str(date_time) if date_time else None,
+                    )
+                )
 
-        if any(message["role"] != "system" for message in messages):
-            await service.add(messages, scope)
+        if turns:
+            speaker_roster = {
+                roster_key: conversation[roster_key]
+                for roster_key in ("speaker_a", "speaker_b")
+                if roster_key in conversation
+            }
+            await service.ingest_session(
+                SessionInput(
+                    turns=turns,
+                    source_session_id=key,
+                    observed_at=str(date_time) if date_time else None,
+                    speaker_roster=speaker_roster or None,
+                ),
+                scope,
+            )
             sessions_ingested += 1
     return sessions_ingested
 
@@ -216,7 +236,20 @@ async def judge_answer(llm: LLMClient, question: str, gold: str, prediction: str
     return _as_bool(result.get("correct"))
 
 
-def recall_at_k(gold: str, retrieved: list[ScoredMemory]) -> bool | None:
+def _retrieved_text(retrieved: list[ScoredMemory] | list[RetrievedEvidence]) -> str:
+    chunks: list[str] = []
+    for item in retrieved:
+        if hasattr(item, "memory"):
+            chunks.append(item.memory.content)
+        else:
+            chunks.append(item.content)
+    return " ".join(chunks)
+
+
+def recall_at_k(
+    gold: str,
+    retrieved: list[ScoredMemory] | list[RetrievedEvidence],
+) -> bool | None:
     """Proxy: are the gold answer's content words present in the retrieved memories?
 
     Returns None when recall is not meaningful (empty/abstention answers). This is a
@@ -228,8 +261,7 @@ def recall_at_k(gold: str, retrieved: list[ScoredMemory]) -> bool | None:
     gold_tokens = _content_tokens(gold)
     if not gold_tokens:
         return None
-    retrieved_text = " ".join(scored.memory.content for scored in retrieved)
-    found = gold_tokens & _content_tokens(retrieved_text)
+    found = gold_tokens & _content_tokens(_retrieved_text(retrieved))
     return len(found) / len(gold_tokens) >= 0.6
 
 
@@ -287,10 +319,12 @@ async def run(args: argparse.Namespace) -> None:
 
     answerer_provider = args.answerer_provider or settings.llm_provider
     answerer_model = args.answerer_model or settings.llm_model
-    answerer = build_llm_client(answerer_provider, answerer_model)
+    answerer = None
+    if args.retrieve_from == "memories":
+        answerer = build_llm_client(answerer_provider, answerer_model)
 
     judge = None
-    if args.judge != "none":
+    if args.retrieve_from == "memories" and args.judge != "none":
         judge_model = args.judge_model or (
             "deepseek-v4-pro" if args.judge == "deepseek" else settings.llm_model
         )
@@ -298,7 +332,8 @@ async def run(args: argparse.Namespace) -> None:
 
     print(
         f"Memory backend: {settings.llm_provider}/{settings.llm_model}  |  "
-        f"answerer: {answerer_provider}/{answerer_model}  |  "
+        f"retrieve_from: {args.retrieve_from}  |  "
+        f"answerer: {answerer_provider + '/' + answerer_model if answerer else 'skipped'}  |  "
         f"judge: {args.judge if judge else 'none (heuristic)'}"
     )
     print(f"Conversations: {len(samples)}  |  retrieval k={args.k}")
@@ -337,27 +372,52 @@ async def run(args: argparse.Namespace) -> None:
                 gold = _gold_answer(item)
                 category = CATEGORY_NAMES.get(item.get("category"), str(item.get("category")))
 
-                retrieved = await service.search(question, scope, limit=args.k)
-                prediction = await answer_question(answerer, question, retrieved)
-
-                if judge is not None:
-                    correct = await judge_answer(judge, question, gold, prediction)
+                if args.retrieve_from == "turns":
+                    retrieved_turns = await service.search_turns(
+                        question,
+                        scope,
+                        limit=args.k,
+                    )
+                    records.append(
+                        {
+                            "sample_id": sample_id,
+                            "category": category,
+                            "question": question,
+                            "gold": gold,
+                            "prediction": "",
+                            "retrieved": [hit.content for hit in retrieved_turns],
+                            "retrieved_turn_ids": [
+                                source_turn_id
+                                for hit in retrieved_turns
+                                for source_turn_id in hit.source_turn_ids
+                            ],
+                            "recall_hit": recall_at_k(gold, retrieved_turns),
+                            "correct": None,
+                            "judged": False,
+                        }
+                    )
                 else:
-                    correct = heuristic_correct(gold, prediction)
+                    retrieved = await service.search(question, scope, limit=args.k)
+                    prediction = await answer_question(answerer, question, retrieved)
 
-                records.append(
-                    {
-                        "sample_id": sample_id,
-                        "category": category,
-                        "question": question,
-                        "gold": gold,
-                        "prediction": prediction,
-                        "retrieved": [scored.memory.content for scored in retrieved],
-                        "recall_hit": recall_at_k(gold, retrieved),
-                        "correct": correct,
-                        "judged": judge is not None,
-                    }
-                )
+                    if judge is not None:
+                        correct = await judge_answer(judge, question, gold, prediction)
+                    else:
+                        correct = heuristic_correct(gold, prediction)
+
+                    records.append(
+                        {
+                            "sample_id": sample_id,
+                            "category": category,
+                            "question": question,
+                            "gold": gold,
+                            "prediction": prediction,
+                            "retrieved": [scored.memory.content for scored in retrieved],
+                            "recall_hit": recall_at_k(gold, retrieved),
+                            "correct": correct,
+                            "judged": judge is not None,
+                        }
+                    )
     finally:
         if temp_dir is not None:
             temp_dir.cleanup()
@@ -368,7 +428,9 @@ async def run(args: argparse.Namespace) -> None:
 
     print_summary(records, judged=judge is not None)
     print(f"\nPredictions written to {out_path}")
-    if judge is None:
+    if args.retrieve_from == "turns":
+        print("Raw-turn mode skips answer generation and judge scoring.")
+    elif judge is None:
         print(
             "No LLM judge was used; 'acc' is a token-overlap heuristic. For real numbers, "
             "rerun with --judge deepseek (or grade the JSONL with the LOCOMO judge)."
@@ -394,6 +456,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge", choices=("none", "ollama", "deepseek"), default="none")
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--db-path", default=None, help="Memory DB path (default: fresh temp DB)")
+    parser.add_argument(
+        "--retrieve-from",
+        choices=("memories", "turns"),
+        default="memories",
+        help="Retrieve distilled memories or raw turns at QA time",
+    )
     return parser.parse_args()
 
 

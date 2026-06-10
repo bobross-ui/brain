@@ -8,15 +8,17 @@ the memory service as an MCP stdio server.
 
 | Layer | Status | What works now |
 | --- | --- | --- |
-| Layer 1: Storage + Retrieval | Complete | SQLite + sqlite-vec store, local embedder, scoped add/search/get/delete/update, Layer 1 demo |
+| Layer 1: Storage + Retrieval | Complete | SQLite + sqlite-vec memories, append-only raw sessions/turns, FTS5/BM25 turn retrieval, scoped CRUD |
 | Layer 2: Extraction + Naive Add | Complete | Ollama-backed fact extraction, fake LLM fixture path, always-add reconciler, MemoryService facade, Layer 2 demo |
 | Layer 3: Reconciliation | Complete | LLM-backed ADD/UPDATE/DELETE/NOOP reconciler, candidate thresholding, update-in-place path, Layer 3 demo |
 | Layer 4: MCP Server | Complete | `remember`, `recall`, and `forget` MCP tools over stdio |
 
-Current behavior: messages are extracted into atomic facts, scope-filtered similar memories are
-retrieved, and the active reconciler decides whether to add, update, delete, or skip each fact.
-The default factory wires `LLMReconciler` with the configured LLM backend and the MCP server wraps
-that service over stdio. Auth and HTTP transport are not built.
+Current behavior: raw sessions and turns are stored before extraction. Messages are then extracted
+into atomic facts, scope-filtered similar memories are retrieved, and the active reconciler decides
+whether to add, update, delete, or skip each fact. Session ingestion is idempotent and retry-safe;
+raw turns are searchable through SQLite FTS5/BM25. The default factory wires `LLMReconciler` with
+the configured LLM backend and the MCP server wraps that service over stdio. Auth and HTTP transport
+are not built.
 
 ## Architecture
 
@@ -29,7 +31,8 @@ The core seams are:
   `DeepSeekLLMClient`.
 - `Reconciler`: decides what to do with extracted facts. Current implementations:
   `AlwaysAddReconciler` and `LLMReconciler`.
-- `MemoryService`: facade used by later layers: `add`, `search`, `get`, and `forget`.
+- `MemoryService`: facade used by later layers: `add`, `ingest_session`, `search`,
+  `search_turns`, `get`, and `forget`.
 
 Memory scope is always explicit through `Scope(user_id, agent_id, namespace)`. Search and read paths
 filter by `user_id` and `namespace`.
@@ -38,7 +41,7 @@ filter by `user_id` and `namespace`.
 
 - Python 3.11+
 - `uv`
-- macOS/Linux with local SQLite extension support
+- macOS/Linux with local SQLite extension and FTS5 support
 - Ollama for the default local backend, live local tests, demos, and MCP `remember` calls
 
 Install `uv` on macOS:
@@ -98,8 +101,8 @@ is `brain.llm.build_llm_client(provider, model)`.
 
 Embeddings are produced locally by `SentenceTransformerEmbedder` and selected with
 `BRAIN_EMBEDDER_MODEL` (default `sentence-transformers/all-MiniLM-L6-v2`, 384-dim). The
-sqlite-vec column width is derived from the embedder's `dim` and templated into `schema.sql`
-at schema-creation time, so any model works without code changes.
+sqlite-vec column width is derived from the embedder's `dim` and templated into the initial
+schema migration at database-creation time, so any model works without code changes.
 
 Because `CREATE VIRTUAL TABLE` fixes the vector dimension at creation, switching to a
 **different-dimension** model requires rebuilding the database — delete `BRAIN_DB_PATH` and let
@@ -247,13 +250,15 @@ uv run pytest tests/test_store.py -k "live_embedder" -v -s
 
 ## Evaluation (LOCOMO)
 
-`scripts/eval_locomo.py` benchmarks Brain on the LOCOMO long-conversation dataset. It drives
-the public API in three phases: ingest each conversation session-by-session via
-`MemoryService.add()` (one `Scope(user_id=sample_id)` per conversation for isolation),
-retrieve per question via `MemoryService.search()`, then answer from only the retrieved
-memories. It reports a **recall@k** proxy (did the gold answer's content words land in the
-retrieved memories — separates retrieval from generation failures) alongside correctness, and
-writes per-question predictions to JSONL for offline grading.
+`scripts/eval_locomo.py` benchmarks Brain on the LOCOMO long-conversation dataset. It ingests each
+conversation session-by-session via `MemoryService.ingest_session()` while preserving session IDs,
+turn IDs, speakers, and dates. With `--retrieve-from memories`, it retrieves via
+`MemoryService.search()`, answers from the retrieved memories, and optionally judges correctness.
+With `--retrieve-from turns`, it retrieves raw turns through FTS5/BM25 and reports retrieval recall
+only; answer generation and judge scoring are intentionally deferred until the unified evidence
+answer path is implemented.
+
+Both modes report a **recall@k** token-overlap proxy and write per-question records to JSONL.
 
 Get the dataset (`locomo10.json`) from the LOCOMO repo (`snap-research/locomo`); confirm its
 schema and category mapping there. Then:
@@ -261,6 +266,12 @@ schema and category mapping there. Then:
 ```bash
 # Quick run: 1 conversation, local memory + heuristic scoring (no API cost)
 uv run python scripts/eval_locomo.py --dataset path/to/locomo10.json
+
+# Phase 1 raw-turn retrieval baseline; skips answer generation and judge scoring
+uv run python scripts/eval_locomo.py \
+  --dataset path/to/locomo10.json \
+  --retrieve-from turns \
+  --out eval_results/locomo_turns_phase1_baseline.jsonl
 
 # Full setup: local memory backend, DeepSeek as a stronger answerer + LLM judge
 LLM_PROVIDER=ollama uv run python scripts/eval_locomo.py \
@@ -271,10 +282,16 @@ LLM_PROVIDER=ollama uv run python scripts/eval_locomo.py \
 
 The memory backend (extraction + reconciliation) follows `LLM_PROVIDER`/`LLM_MODEL`; the
 answerer and judge are chosen independently via flags, so you can isolate memory quality from
-the answerer LLM. Start with `--max-conversations 1` — a full LOCOMO conversation is hundreds
-of turns and ingests slowly through a local model. `LongMemEval` is the more rigorous follow-up
-benchmark (its knowledge-update and temporal-reasoning categories directly exercise the
-reconciler); this harness is the skeleton for that run.
+the answerer LLM. Raw-turn mode still runs extraction during shared ingestion, so it is not yet a
+fast retrieval-only data load. Start with `--max-conversations 1` — a full LOCOMO conversation is
+hundreds of turns and ingests slowly.
+
+Phase 1 baseline on the first conversation (`conv-26`, 199 questions, `k=10`) reached **0.349
+recall@10** overall with raw-turn BM25. This is the harness's token-overlap proxy, not evidence-ID
+recall or answer accuracy.
+
+`LongMemEval` is the more rigorous follow-up benchmark (its knowledge-update and temporal-reasoning
+categories directly exercise the reconciler); this harness is the skeleton for that run.
 
 ## Project Layout
 
@@ -290,7 +307,7 @@ src/brain/
   reconcile.py       # AlwaysAddReconciler and LLMReconciler
   store/
     base.py          # MemoryStore interface
-    schema.sql       # SQLite/sqlite-vec schema
+    migrations/      # ordered SQLite schema migrations
     sqlite.py        # SQLiteMemoryStore
 
 scripts/
@@ -300,7 +317,9 @@ scripts/
   eval_locomo.py
 
 tests/
-  test_store.py      # Layer 1 tests
+  test_store.py      # memory store tests
+  test_ingest.py     # raw session/turn ingestion and retrieval tests
+  test_migrations.py # schema migration tests
   test_extract.py    # Layer 2 tests
   test_reconcile.py  # Layer 3 tests
   test_mcp.py        # Layer 4 MCP transport tests
@@ -316,8 +335,12 @@ tests/
 Implemented:
 
 - SQLite + sqlite-vec schema with scoped rows.
+- Versioned schema migrations.
+- Append-only sessions and raw turns preserving source IDs, speakers, and timestamps.
+- Idempotent, retry-safe session ingestion with atomic memory completion.
+- FTS5/BM25 raw-turn retrieval.
 - Async `MemoryStore` interface.
-- `SQLiteMemoryStore` with `add`, `search`, `get`, `delete`, and `update`.
+- `SQLiteMemoryStore` with memory CRUD plus session ingestion, turn lookup, and turn search.
 - `SentenceTransformerEmbedder` and deterministic `FakeEmbedder`.
 - Layer 1 demo and store tests.
 
@@ -325,7 +348,8 @@ Verification:
 
 ```bash
 uv run python scripts/demo_layer1.py
-uv run pytest tests/test_store.py -k "not live_embedder" -v
+uv run pytest tests/test_store.py tests/test_ingest.py tests/test_migrations.py \
+  -k "not live_embedder" -v
 ```
 
 ### Layer 2: Extraction + Naive Add

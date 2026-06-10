@@ -2,7 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 
-from brain.models import Scope
+from brain.models import RetrievedEvidence, Scope
 
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location(
@@ -14,13 +14,16 @@ _spec.loader.exec_module(eval_locomo)
 
 class _RecordingService:
     def __init__(self):
-        self.adds: list[list[dict]] = []
+        self.sessions = []
 
-    async def add(self, messages, scope):
-        self.adds.append(messages)
-        return []
+    async def ingest_session(self, session, scope):
+        self.sessions.append(session)
+        return None
 
     async def search(self, query, scope, limit):
+        return []
+
+    async def search_turns(self, query, scope, limit):
         return []
 
 
@@ -59,6 +62,20 @@ def test_recall_at_k_proxy():
     assert eval_locomo.recall_at_k("Tokyo", retrieved) is False
     # abstention answers are not scored for recall
     assert eval_locomo.recall_at_k("No information available", retrieved) is None
+
+
+def test_recall_at_k_proxy_accepts_turn_evidence():
+    retrieved = [
+        RetrievedEvidence(
+            kind="turn",
+            content="Alice moved to Berlin in 2021",
+            score=1.0,
+            turn_id="turn-1",
+            source_turn_ids=["D1:1"],
+        )
+    ]
+
+    assert eval_locomo.recall_at_k("Berlin", retrieved) is True
 
 
 def test_heuristic_correct():
@@ -102,8 +119,8 @@ async def test_ingest_conversation_orders_sessions_and_preserves_speakers():
             "session_2": [{"speaker": "Alice", "text": "second"}],
             "session_1_date_time": "1pm",
             "session_1": [
-                {"speaker": "Alice", "text": "first"},
-                {"speaker": "Bob", "text": "hi"},
+                {"speaker": "Alice", "text": "first", "dia_id": "D1:1"},
+                {"speaker": "Bob", "text": "hi", "dia_id": "D1:2"},
             ],
         },
     }
@@ -114,8 +131,16 @@ async def test_ingest_conversation_orders_sessions_and_preserves_speakers():
 
     assert count == 2
     # session_1 ingested before session_2
-    first_session = service.adds[0]
-    assert first_session[0] == {"role": "system", "content": "[Conversation session dated 1pm]"}
-    assert {"role": "Alice", "content": "first"} in first_session
-    assert {"role": "Bob", "content": "hi"} in first_session
-    assert service.adds[1][-1] == {"role": "Alice", "content": "second"}
+    first_session = service.sessions[0]
+    assert first_session.source_session_id == "session_1"
+    assert first_session.observed_at == "1pm"
+    assert first_session.speaker_roster == {"speaker_a": "Alice", "speaker_b": "Bob"}
+    assert first_session.turns[0].speaker == "Alice"
+    assert first_session.turns[0].text == "first"
+    assert first_session.turns[0].source_turn_id == "D1:1"
+    assert first_session.turns[0].observed_at == "1pm"
+    assert first_session.turns[1].speaker == "Bob"
+    assert first_session.turns[1].source_turn_id == "D1:2"
+    assert service.sessions[1].source_session_id == "session_2"
+    assert service.sessions[1].turns[0].speaker == "Alice"
+    assert service.sessions[1].turns[0].text == "second"
