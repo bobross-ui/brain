@@ -27,13 +27,24 @@ class _RecordingService:
         return []
 
 
-def _scored(content: str):
+def _scored(content: str, source_turn_ids: list[str] | None = None):
     # Minimal stand-in matching the .memory.content access path used by the harness.
     class _M:
-        def __init__(self, c):
-            self.memory = type("Mem", (), {"content": c})
+        def __init__(self, c, turn_ids):
+            self.score = 0.9
+            self.memory = type(
+                "Mem",
+                (),
+                {
+                    "id": "memory-1",
+                    "content": c,
+                    "source_turn_ids": turn_ids,
+                    "source_session_id": "session_1",
+                    "observed_at": "2023-05-07T10:00:00",
+                },
+            )
 
-    return _M(content)
+    return _M(content, source_turn_ids or [])
 
 
 def test_session_keys_sorted_numerically():
@@ -76,6 +87,48 @@ def test_recall_at_k_proxy_accepts_turn_evidence():
     ]
 
     assert eval_locomo.recall_at_k("Berlin", retrieved) is True
+
+
+def test_evidence_recall_scores_full_partial_and_missing_evidence():
+    assert eval_locomo.evidence_recall(
+        ["D1:3"],
+        {"D1:3", "D2:1"},
+    ) == 1.0
+    assert eval_locomo.evidence_recall(
+        ["D1:3", "D1:4"],
+        {"D1:3"},
+    ) == 0.5
+    assert eval_locomo.evidence_recall([], {"D1:3"}) is None
+
+
+def test_evidence_fields_flatten_memory_provenance_and_report_hit():
+    retrieved = [
+        _scored("Alice moved to Berlin.", ["D1:3", "D1:4"]),
+        _scored("Alice likes jazz.", ["D2:1"]),
+    ]
+
+    fields = eval_locomo._evidence_fields(["D1:3", "D1:4"], retrieved)
+
+    assert fields == {
+        "gold_evidence": ["D1:3", "D1:4"],
+        "retrieved_turn_ids": ["D1:3", "D1:4", "D2:1"],
+        "evidence_recall": 1.0,
+        "evidence_hit": True,
+    }
+
+
+def test_evidence_hit_is_none_without_gold_evidence():
+    assert eval_locomo.evidence_hit([], {"D1:3"}) is None
+
+
+def test_summary_evidence_recall_falls_back_to_proxy_for_old_records():
+    assert eval_locomo._summary_evidence_recall({"recall_hit": True}) is True
+    assert (
+        eval_locomo._summary_evidence_recall(
+            {"recall_hit": True, "evidence_recall": None}
+        )
+        is None
+    )
 
 
 def test_heuristic_correct():

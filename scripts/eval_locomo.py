@@ -8,10 +8,10 @@ Three phases, all driving Brain's public API:
   2. Retrieve - for each question, either MemoryService.search(question, scope, limit=k)
                 over distilled memories or MemoryService.search_turns(...) over raw turns.
                 The raw-turn mode reports retrieval recall only and skips answer/judge.
-  3. Score    - recall@k proxy (did the gold answer's content words land in the
-                retrieved memories?) to separate retrieval from generation, plus
-                correctness via an optional LLM judge (falls back to a token-overlap
-                heuristic). Predictions are also written to JSONL for offline grading.
+  3. Score    - true evidence recall from gold/retrieved dia_ids, the previous
+                answer-token recall@k proxy for comparison, and correctness via an
+                optional LLM judge (falls back to a token-overlap heuristic).
+                Predictions are also written to JSONL for offline grading.
 
 The memory backend (extraction + reconciliation) is whatever LLM_PROVIDER / LLM_MODEL
 point at (ollama or deepseek). The answerer and judge are chosen independently via flags
@@ -151,6 +151,17 @@ def _gold_answer(item: dict) -> str:
     return "" if answer is None else str(answer)
 
 
+def _gold_evidence(item: dict) -> list[str]:
+    evidence = item.get("evidence")
+    if evidence is None:
+        return []
+    if isinstance(evidence, str):
+        return [evidence] if evidence else []
+    if not isinstance(evidence, (list, tuple, set)):
+        return []
+    return [str(source_turn_id) for source_turn_id in evidence if source_turn_id]
+
+
 async def ingest_conversation(
     service,
     sample: dict,
@@ -265,6 +276,70 @@ def recall_at_k(
     return len(found) / len(gold_tokens) >= 0.6
 
 
+def evidence_recall(
+    gold_evidence: list[str],
+    retrieved_turn_ids: set[str],
+) -> float | None:
+    gold_turn_ids = set(gold_evidence)
+    if not gold_turn_ids:
+        return None
+    return len(gold_turn_ids & retrieved_turn_ids) / len(gold_turn_ids)
+
+
+def evidence_hit(
+    gold_evidence: list[str],
+    retrieved_turn_ids: set[str],
+) -> bool | None:
+    recall = evidence_recall(gold_evidence, retrieved_turn_ids)
+    return None if recall is None else recall > 0.0
+
+
+def _as_retrieved_evidence(
+    retrieved: list[ScoredMemory] | list[RetrievedEvidence],
+) -> list[RetrievedEvidence]:
+    evidence: list[RetrievedEvidence] = []
+    for item in retrieved:
+        if isinstance(item, RetrievedEvidence):
+            evidence.append(item)
+            continue
+
+        memory = item.memory
+        evidence.append(
+            RetrievedEvidence(
+                kind="memory",
+                content=memory.content,
+                score=item.score,
+                memory_id=memory.id,
+                source_turn_ids=memory.source_turn_ids,
+                source_session_id=memory.source_session_id,
+                observed_at=memory.observed_at,
+            )
+        )
+    return evidence
+
+
+def _retrieved_turn_ids(retrieved: list[RetrievedEvidence]) -> set[str]:
+    return {
+        source_turn_id
+        for hit in retrieved
+        for source_turn_id in hit.source_turn_ids
+        if source_turn_id
+    }
+
+
+def _evidence_fields(
+    gold_evidence: list[str],
+    retrieved: list[ScoredMemory] | list[RetrievedEvidence],
+) -> dict:
+    retrieved_turn_ids = _retrieved_turn_ids(_as_retrieved_evidence(retrieved))
+    return {
+        "gold_evidence": gold_evidence,
+        "retrieved_turn_ids": sorted(retrieved_turn_ids),
+        "evidence_recall": evidence_recall(gold_evidence, retrieved_turn_ids),
+        "evidence_hit": evidence_hit(gold_evidence, retrieved_turn_ids),
+    }
+
+
 def heuristic_correct(gold: str, prediction: str) -> bool | None:
     """Token-overlap fallback when no LLM judge is configured."""
     if _is_abstention(gold):
@@ -275,9 +350,15 @@ def heuristic_correct(gold: str, prediction: str) -> bool | None:
     return len(gold_tokens & _content_tokens(prediction)) / len(gold_tokens) >= 0.6
 
 
-def _mean(values: list[bool]) -> float | None:
-    scored = [bool(value) for value in values if value is not None]
+def _mean(values: list[bool | float | None]) -> float | None:
+    scored = [float(value) for value in values if value is not None]
     return sum(scored) / len(scored) if scored else None
+
+
+def _summary_evidence_recall(record: dict) -> float | bool | None:
+    if "evidence_recall" in record:
+        return record["evidence_recall"]
+    return record.get("recall_hit")
 
 
 def print_summary(records: list[dict], judged: bool) -> None:
@@ -286,26 +367,43 @@ def print_summary(records: list[dict], judged: bool) -> None:
         by_category[record["category"]].append(record)
 
     label = "judge" if judged else "heuristic"
-    print("\n" + "=" * 64)
+    print("\n" + "=" * 76)
     print(f"LOCOMO results  ({len(records)} questions)")
-    print("=" * 64)
-    header = f"{'category':<14}{'n':>5}{'  acc(' + label + ')':>18}{'recall@k':>12}"
+    print("=" * 76)
+    header = (
+        f"{'category':<14}{'n':>5}{'  acc(' + label + ')':>18}"
+        f"{'recall@k':>12}{'ev_recall':>12}"
+    )
     print(header)
-    print("-" * 64)
+    print("-" * 76)
     for category in sorted(by_category):
         rows = by_category[category]
         acc = _mean([row["correct"] for row in rows])
         recall = _mean([row["recall_hit"] for row in rows])
+        ev_recall = _mean([_summary_evidence_recall(row) for row in rows])
         acc_text = f"{acc:.3f}" if acc is not None else "n/a"
         recall_text = f"{recall:.3f}" if recall is not None else "n/a"
-        print(f"{category:<14}{len(rows):>5}{acc_text:>18}{recall_text:>12}")
-    print("-" * 64)
+        ev_recall_text = f"{ev_recall:.3f}" if ev_recall is not None else "n/a"
+        print(
+            f"{category:<14}{len(rows):>5}{acc_text:>18}"
+            f"{recall_text:>12}{ev_recall_text:>12}"
+        )
+    print("-" * 76)
     overall_acc = _mean([row["correct"] for row in records])
     overall_recall = _mean([row["recall_hit"] for row in records])
+    overall_ev_recall = _mean(
+        [_summary_evidence_recall(row) for row in records]
+    )
     acc_text = f"{overall_acc:.3f}" if overall_acc is not None else "n/a"
     recall_text = f"{overall_recall:.3f}" if overall_recall is not None else "n/a"
-    print(f"{'OVERALL':<14}{len(records):>5}{acc_text:>18}{recall_text:>12}")
-    print("=" * 64)
+    ev_recall_text = (
+        f"{overall_ev_recall:.3f}" if overall_ev_recall is not None else "n/a"
+    )
+    print(
+        f"{'OVERALL':<14}{len(records):>5}{acc_text:>18}"
+        f"{recall_text:>12}{ev_recall_text:>12}"
+    )
+    print("=" * 76)
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -370,6 +468,7 @@ async def run(args: argparse.Namespace) -> None:
                 if not question:
                     continue
                 gold = _gold_answer(item)
+                gold_evidence = _gold_evidence(item)
                 category = CATEGORY_NAMES.get(item.get("category"), str(item.get("category")))
 
                 if args.retrieve_from == "turns":
@@ -386,11 +485,7 @@ async def run(args: argparse.Namespace) -> None:
                             "gold": gold,
                             "prediction": "",
                             "retrieved": [hit.content for hit in retrieved_turns],
-                            "retrieved_turn_ids": [
-                                source_turn_id
-                                for hit in retrieved_turns
-                                for source_turn_id in hit.source_turn_ids
-                            ],
+                            **_evidence_fields(gold_evidence, retrieved_turns),
                             "recall_hit": recall_at_k(gold, retrieved_turns),
                             "correct": None,
                             "judged": False,
@@ -413,6 +508,7 @@ async def run(args: argparse.Namespace) -> None:
                             "gold": gold,
                             "prediction": prediction,
                             "retrieved": [scored.memory.content for scored in retrieved],
+                            **_evidence_fields(gold_evidence, retrieved),
                             "recall_hit": recall_at_k(gold, retrieved),
                             "correct": correct,
                             "judged": judge is not None,
