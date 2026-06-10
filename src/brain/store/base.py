@@ -19,6 +19,11 @@ class MemoryStore(ABC):
         content: str,
         scope: Scope,
         metadata: dict | None = None,
+        *,
+        subject: str | None = None,
+        internal_turn_ids: list[str] | None = None,
+        observed_at: str | None = None,
+        source_session_id: str | None = None,
     ) -> Memory:
         ...
 
@@ -40,7 +45,17 @@ class MemoryStore(ABC):
         ...
 
     @abstractmethod
-    async def update(self, id: str, content: str, scope: Scope) -> Memory | None:
+    async def update(
+        self,
+        id: str,
+        content: str,
+        scope: Scope,
+        *,
+        internal_turn_ids: list[str] | None = None,
+        subject: str | None = None,
+        observed_at: str | None = None,
+        source_session_id: str | None = None,
+    ) -> Memory | None:
         ...
 
     async def ingest_session_turns(

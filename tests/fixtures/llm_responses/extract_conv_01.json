@@ -1,9 +1,29 @@
 {
   "facts": [
-    "The user moved to Berlin last month.",
-    "The user works as a software engineer.",
-    "The user cycles to work every day.",
-    "The user plays chess in the evenings.",
-    "The user is vegetarian."
+    {
+      "content": "The user moved to Berlin last month.",
+      "subject": "user",
+      "supporting_turn_ids": ["message-0"]
+    },
+    {
+      "content": "The user works as a software engineer.",
+      "subject": "user",
+      "supporting_turn_ids": ["message-2"]
+    },
+    {
+      "content": "The user cycles to work every day.",
+      "subject": "user",
+      "supporting_turn_ids": ["message-2"]
+    },
+    {
+      "content": "The user plays chess in the evenings.",
+      "subject": "user",
+      "supporting_turn_ids": ["message-4"]
+    },
+    {
+      "content": "The user is vegetarian.",
+      "subject": "user",
+      "supporting_turn_ids": ["message-4"]
+    }
   ]
 }

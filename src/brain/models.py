@@ -17,6 +17,10 @@ class Memory(BaseModel):
     agent_id: str | None = None
     namespace: str = "default"
     metadata: dict = Field(default_factory=dict)
+    subject: str | None = None
+    source_turn_ids: list[str] = Field(default_factory=list)
+    source_session_id: str | None = None
+    observed_at: str | None = None
     content_hash: str
     created_at: str
     updated_at: str
@@ -76,6 +80,8 @@ class RetrievedEvidence(BaseModel):
 
 class FactCandidate(BaseModel):
     content: str
+    subject: str | None = None
+    source_turn_ids: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
 
 
@@ -91,6 +97,10 @@ class MemoryAction(BaseModel):
     content: str | None = None
     target_id: str | None = None
     metadata: dict = Field(default_factory=dict)
+    subject: str | None = None
+    internal_turn_ids: list[str] | None = None
+    source_session_id: str | None = None
+    observed_at: str | None = None
 
 
 class Reconciler(ABC):

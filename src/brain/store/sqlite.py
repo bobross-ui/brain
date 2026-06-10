@@ -160,6 +160,36 @@ def _apply_schema(db_path: str, dim: int) -> None:
         db.close()
 
 
+def _memory_select_columns(alias: str = "memories") -> str:
+    return f"""
+        {alias}.id,
+        {alias}.content,
+        {alias}.user_id,
+        {alias}.agent_id,
+        {alias}.namespace,
+        {alias}.metadata,
+        {alias}.subject,
+        {alias}.source_session_id,
+        {alias}.observed_at,
+        {alias}.content_hash,
+        {alias}.created_at,
+        {alias}.updated_at,
+        COALESCE(
+            (
+                SELECT json_group_array(linked_turns.source_turn_id)
+                FROM (
+                    SELECT turns.source_turn_id
+                    FROM memory_sources
+                    JOIN turns ON turns.id = memory_sources.turn_id
+                    WHERE memory_sources.memory_id = {alias}.id
+                    ORDER BY turns.seq, turns.source_turn_id
+                ) AS linked_turns
+            ),
+            '[]'
+        ) AS source_turn_ids
+    """
+
+
 def _row_to_memory(row: sqlite3.Row | dict[str, Any]) -> Memory:
     return Memory(
         id=row["id"],
@@ -168,6 +198,10 @@ def _row_to_memory(row: sqlite3.Row | dict[str, Any]) -> Memory:
         agent_id=row["agent_id"],
         namespace=row["namespace"],
         metadata=json.loads(row["metadata"]),
+        subject=row["subject"],
+        source_turn_ids=json.loads(row["source_turn_ids"]),
+        source_session_id=row["source_session_id"],
+        observed_at=row["observed_at"],
         content_hash=row["content_hash"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -204,6 +238,11 @@ class SQLiteMemoryStore(MemoryStore):
         content: str,
         scope: Scope,
         metadata: dict | None = None,
+        *,
+        subject: str | None = None,
+        internal_turn_ids: list[str] | None = None,
+        observed_at: str | None = None,
+        source_session_id: str | None = None,
     ) -> Memory:
         embedding = await self._embedder.embed(content)
         memory_id = str(uuid.uuid4())
@@ -214,13 +253,15 @@ class SQLiteMemoryStore(MemoryStore):
         def _work() -> dict[str, Any]:
             db = _open_db(self._db_path)
             try:
+                db.execute("BEGIN")
                 cursor = db.execute(
                     """
                     INSERT INTO memories (
                         id, content, user_id, agent_id, namespace, metadata,
-                        content_hash, created_at, updated_at
+                        subject, source_session_id, observed_at, content_hash,
+                        created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         memory_id,
@@ -229,6 +270,9 @@ class SQLiteMemoryStore(MemoryStore):
                         scope.agent_id,
                         scope.namespace,
                         metadata_text,
+                        subject,
+                        source_session_id,
+                        observed_at,
                         content_hash,
                         now,
                         now,
@@ -247,17 +291,32 @@ class SQLiteMemoryStore(MemoryStore):
                         scope.namespace,
                     ),
                 )
-                return {
-                    "id": memory_id,
-                    "content": content,
-                    "user_id": scope.user_id,
-                    "agent_id": scope.agent_id,
-                    "namespace": scope.namespace,
-                    "metadata": metadata_text,
-                    "content_hash": content_hash,
-                    "created_at": now,
-                    "updated_at": now,
-                }
+                for turn_id in dict.fromkeys(internal_turn_ids or []):
+                    db.execute(
+                        """
+                        INSERT INTO memory_sources(memory_id, turn_id)
+                        VALUES (?, ?)
+                        """,
+                        (memory_id, turn_id),
+                    )
+                row = db.execute(
+                    f"""
+                    SELECT {_memory_select_columns("memories")}
+                    FROM memories
+                    WHERE memories.id = ?
+                    """,
+                    (memory_id,),
+                ).fetchone()
+                db.execute("COMMIT")
+                if row is None:
+                    raise RuntimeError("Failed to read inserted memory")
+                return dict(row)
+            except Exception:
+                try:
+                    db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
             finally:
                 db.close()
 
@@ -405,6 +464,10 @@ class SQLiteMemoryStore(MemoryStore):
                 "target_id": action.target_id,
                 "content": action.content,
                 "metadata": dict(action.metadata),
+                "subject": action.subject,
+                "internal_turn_ids": action.internal_turn_ids,
+                "source_session_id": action.source_session_id,
+                "observed_at": action.observed_at,
                 "embedding": None,
                 "id": str(uuid.uuid4()),
                 "created_at": now,
@@ -450,9 +513,10 @@ class SQLiteMemoryStore(MemoryStore):
                             """
                             INSERT INTO memories (
                                 id, content, user_id, agent_id, namespace, metadata,
-                                content_hash, created_at, updated_at
+                                subject, source_session_id, observed_at, content_hash,
+                                created_at, updated_at
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 prepared["id"],
@@ -461,6 +525,9 @@ class SQLiteMemoryStore(MemoryStore):
                                 scope.agent_id,
                                 scope.namespace,
                                 metadata_text,
+                                prepared["subject"],
+                                prepared["source_session_id"],
+                                prepared["observed_at"],
                                 prepared["content_hash"],
                                 prepared["created_at"],
                                 prepared["updated_at"],
@@ -479,23 +546,30 @@ class SQLiteMemoryStore(MemoryStore):
                                 scope.namespace,
                             ),
                         )
-                        returned.append(
-                            {
-                                "id": prepared["id"],
-                                "content": content,
-                                "user_id": scope.user_id,
-                                "agent_id": scope.agent_id,
-                                "namespace": scope.namespace,
-                                "metadata": metadata_text,
-                                "content_hash": prepared["content_hash"],
-                                "created_at": prepared["created_at"],
-                                "updated_at": prepared["updated_at"],
-                            }
-                        )
+                        for turn_id in dict.fromkeys(
+                            prepared["internal_turn_ids"] or []
+                        ):
+                            db.execute(
+                                """
+                                INSERT INTO memory_sources(memory_id, turn_id)
+                                VALUES (?, ?)
+                                """,
+                                (prepared["id"], turn_id),
+                            )
+                        inserted = db.execute(
+                            f"""
+                            SELECT {_memory_select_columns("memories")}
+                            FROM memories
+                            WHERE memories.id = ?
+                            """,
+                            (prepared["id"],),
+                        ).fetchone()
+                        if inserted is not None:
+                            returned.append(dict(inserted))
                     elif kind == MemoryActionKind.UPDATE and prepared["target_id"] and content:
                         row = db.execute(
                             """
-                            SELECT rowid
+                            SELECT rowid, metadata
                             FROM memories
                             WHERE id = ? AND user_id = ? AND namespace = ?
                             """,
@@ -504,14 +578,26 @@ class SQLiteMemoryStore(MemoryStore):
                         if row is None:
                             continue
                         rowid = int(row["rowid"])
+                        metadata = json.loads(row["metadata"])
+                        metadata.update(prepared["metadata"])
                         db.execute(
                             """
                             UPDATE memories
-                            SET content = ?, content_hash = ?, updated_at = ?
+                            SET content = ?,
+                                metadata = ?,
+                                subject = COALESCE(?, subject),
+                                source_session_id = COALESCE(?, source_session_id),
+                                observed_at = COALESCE(?, observed_at),
+                                content_hash = ?,
+                                updated_at = ?
                             WHERE rowid = ?
                             """,
                             (
                                 content,
+                                _metadata_json(metadata),
+                                prepared["subject"],
+                                prepared["source_session_id"],
+                                prepared["observed_at"],
                                 prepared["content_hash"],
                                 prepared["updated_at"],
                                 rowid,
@@ -528,12 +614,26 @@ class SQLiteMemoryStore(MemoryStore):
                                 rowid,
                             ),
                         )
+                        if prepared["internal_turn_ids"] is not None:
+                            db.execute(
+                                "DELETE FROM memory_sources WHERE memory_id = ?",
+                                (prepared["target_id"],),
+                            )
+                            for turn_id in dict.fromkeys(
+                                prepared["internal_turn_ids"]
+                            ):
+                                db.execute(
+                                    """
+                                    INSERT INTO memory_sources(memory_id, turn_id)
+                                    VALUES (?, ?)
+                                    """,
+                                    (prepared["target_id"], turn_id),
+                                )
                         updated = db.execute(
-                            """
-                            SELECT id, content, user_id, agent_id, namespace,
-                                   metadata, content_hash, created_at, updated_at
+                            f"""
+                            SELECT {_memory_select_columns("memories")}
                             FROM memories
-                            WHERE rowid = ?
+                            WHERE memories.rowid = ?
                             """,
                             (rowid,),
                         ).fetchone()
@@ -614,10 +714,9 @@ class SQLiteMemoryStore(MemoryStore):
                 placeholders = ",".join("?" for _ in distances)
                 rows = db.execute(
                     f"""
-                    SELECT rowid, id, content, user_id, agent_id, namespace,
-                           metadata, content_hash, created_at, updated_at
+                    SELECT memories.rowid, {_memory_select_columns("memories")}
                     FROM memories
-                    WHERE rowid IN ({placeholders})
+                    WHERE memories.rowid IN ({placeholders})
                     """,
                     tuple(distances),
                 ).fetchall()
@@ -719,11 +818,12 @@ class SQLiteMemoryStore(MemoryStore):
             db = _open_db(self._db_path)
             try:
                 row = db.execute(
-                    """
-                    SELECT id, content, user_id, agent_id, namespace, metadata,
-                           content_hash, created_at, updated_at
+                    f"""
+                    SELECT {_memory_select_columns("memories")}
                     FROM memories
-                    WHERE id = ? AND user_id = ? AND namespace = ?
+                    WHERE memories.id = ?
+                      AND memories.user_id = ?
+                      AND memories.namespace = ?
                     """,
                     (id, scope.user_id, scope.namespace),
                 ).fetchone()
@@ -758,7 +858,17 @@ class SQLiteMemoryStore(MemoryStore):
 
         return await asyncio.to_thread(_work)
 
-    async def update(self, id: str, content: str, scope: Scope) -> Memory | None:
+    async def update(
+        self,
+        id: str,
+        content: str,
+        scope: Scope,
+        *,
+        internal_turn_ids: list[str] | None = None,
+        subject: str | None = None,
+        observed_at: str | None = None,
+        source_session_id: str | None = None,
+    ) -> Memory | None:
         existing = await self.get(id, scope)
         if existing is None:
             return None
@@ -770,6 +880,7 @@ class SQLiteMemoryStore(MemoryStore):
         def _work() -> dict[str, Any] | None:
             db = _open_db(self._db_path)
             try:
+                db.execute("BEGIN")
                 row = db.execute(
                     """
                     SELECT rowid
@@ -785,10 +896,23 @@ class SQLiteMemoryStore(MemoryStore):
                 db.execute(
                     """
                     UPDATE memories
-                    SET content = ?, content_hash = ?, updated_at = ?
+                    SET content = ?,
+                        subject = COALESCE(?, subject),
+                        source_session_id = COALESCE(?, source_session_id),
+                        observed_at = COALESCE(?, observed_at),
+                        content_hash = ?,
+                        updated_at = ?
                     WHERE rowid = ?
                     """,
-                    (content, content_hash, updated_at, rowid),
+                    (
+                        content,
+                        subject,
+                        source_session_id,
+                        observed_at,
+                        content_hash,
+                        updated_at,
+                        rowid,
+                    ),
                 )
                 db.execute(
                     """
@@ -798,16 +922,35 @@ class SQLiteMemoryStore(MemoryStore):
                     """,
                     (sqlite_vec.serialize_float32(embedding), rowid),
                 )
+                if internal_turn_ids is not None:
+                    db.execute(
+                        "DELETE FROM memory_sources WHERE memory_id = ?",
+                        (id,),
+                    )
+                    for turn_id in dict.fromkeys(internal_turn_ids):
+                        db.execute(
+                            """
+                            INSERT INTO memory_sources(memory_id, turn_id)
+                            VALUES (?, ?)
+                            """,
+                            (id, turn_id),
+                        )
                 updated = db.execute(
-                    """
-                    SELECT id, content, user_id, agent_id, namespace, metadata,
-                           content_hash, created_at, updated_at
+                    f"""
+                    SELECT {_memory_select_columns("memories")}
                     FROM memories
-                    WHERE rowid = ?
+                    WHERE memories.rowid = ?
                     """,
                     (rowid,),
                 ).fetchone()
+                db.execute("COMMIT")
                 return dict(updated) if updated is not None else None
+            except Exception:
+                try:
+                    db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
             finally:
                 db.close()
 

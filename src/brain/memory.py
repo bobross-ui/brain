@@ -7,9 +7,11 @@ from brain.embeddings import SentenceTransformerEmbedder
 from brain.extract import Extractor
 from brain.llm import LLMClient, build_llm_client
 from brain.models import (
+    FactCandidate,
     IngestResult,
     Memory,
     MemoryAction,
+    MemoryActionKind,
     Reconciler,
     RetrievedEvidence,
     Scope,
@@ -74,11 +76,20 @@ class MemoryService:
             ingested.extraction_skipped = True
             return ingested
 
-        messages = [
-            {"role": turn.speaker, "content": turn.text}
-            for turn in normalized.turns
-        ]
-        candidates = await self._extractor.extract(messages)
+        candidates = await self._extractor.extract(
+            normalized.turns,
+            roster=normalized.speaker_roster,
+            session_observed_at=normalized.observed_at,
+        )
+        turn_context = {
+            turn.source_turn_id: (internal_id, turn)
+            for turn, internal_id in zip(
+                normalized.turns,
+                ingested.turn_ids,
+                strict=True,
+            )
+            if turn.source_turn_id is not None
+        }
         actions: list[MemoryAction] = []
         for candidate in candidates:
             similar = [
@@ -91,7 +102,15 @@ class MemoryService:
                 if scored.score >= RECONCILE_SCORE_THRESHOLD
             ]
             action: MemoryAction = await self._reconciler.reconcile(candidate, similar)
-            actions.append(action)
+            actions.append(
+                self._attach_provenance(
+                    action,
+                    candidate,
+                    turn_context=turn_context,
+                    source_session_id=normalized.source_session_id,
+                    session_observed_at=normalized.observed_at,
+                )
+            )
 
         memories = await self._store.write_extracted_memories(
             ingested.session_id,
@@ -99,6 +118,60 @@ class MemoryService:
             actions,
         )
         return ingested.model_copy(update={"memories": memories})
+
+    def _attach_provenance(
+        self,
+        action: MemoryAction,
+        candidate: FactCandidate,
+        *,
+        turn_context: dict[str, tuple[str, Turn]],
+        source_session_id: str | None,
+        session_observed_at: str | None,
+    ) -> MemoryAction:
+        resolved = [
+            turn_context[source_turn_id]
+            for source_turn_id in candidate.source_turn_ids
+            if source_turn_id in turn_context
+        ]
+        internal_turn_ids = list(dict.fromkeys(item[0] for item in resolved))
+        unresolved_count = len(candidate.source_turn_ids) - len(resolved)
+
+        subject = candidate.subject
+        if subject is None and resolved:
+            subject = resolved[0][1].speaker
+
+        observed_at = session_observed_at
+        if observed_at is None:
+            observed_at = next(
+                (
+                    turn.observed_at
+                    for _, turn in resolved
+                    if turn.observed_at is not None
+                ),
+                None,
+            )
+
+        metadata = dict(candidate.metadata)
+        metadata.update(action.metadata)
+        metadata["unresolved_source_turn_ids"] = unresolved_count
+        if action.kind == MemoryActionKind.ADD and not internal_turn_ids:
+            metadata["unsourced"] = True
+        elif action.kind == MemoryActionKind.UPDATE and not internal_turn_ids:
+            metadata["provenance_update_skipped"] = True
+
+        action_internal_turn_ids: list[str] | None = internal_turn_ids
+        if action.kind == MemoryActionKind.UPDATE and not internal_turn_ids:
+            action_internal_turn_ids = None
+
+        return action.model_copy(
+            update={
+                "metadata": metadata,
+                "subject": subject,
+                "internal_turn_ids": action_internal_turn_ids,
+                "source_session_id": source_session_id,
+                "observed_at": observed_at,
+            }
+        )
 
     def _session_from_messages(
         self,

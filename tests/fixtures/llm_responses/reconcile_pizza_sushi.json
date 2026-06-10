@@ -2,7 +2,13 @@
   {
     "call": "extract",
     "response": {
-      "facts": ["User prefers sushi"]
+      "facts": [
+        {
+          "content": "User prefers sushi",
+          "subject": "user",
+          "supporting_turn_ids": ["message-0"]
+        }
+      ]
     }
   },
   {

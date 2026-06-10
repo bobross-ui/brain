@@ -23,7 +23,15 @@ def mcp_server(monkeypatch: pytest.MonkeyPatch, store) -> ModuleType:
     service = MemoryService(
         store,
         FakeLLMClient(
-            recorded={"facts": ["The user loves hiking in the mountains."]},
+            recorded={
+                "facts": [
+                    {
+                        "content": "The user loves hiking in the mountains.",
+                        "subject": "user",
+                        "supporting_turn_ids": ["message-0"],
+                    }
+                ]
+            },
         ),
         AlwaysAddReconciler(),
     )
@@ -54,6 +62,8 @@ async def test_remember_then_recall_round_trip(mcp_server: ModuleType):
             assert "id" in memory
             assert "content" in memory
             assert isinstance(memory["id"], str)
+            assert memory["subject"] == "user"
+            assert memory["source_turn_ids"] == ["message-0"]
 
         recall_result = await client.call_tool(
             "recall",
@@ -71,6 +81,8 @@ async def test_remember_then_recall_round_trip(mcp_server: ModuleType):
         assert isinstance(hit["score"], float)
         assert isinstance(hit["memory"]["content"], str)
         assert len(hit["memory"]["content"]) > 0
+        assert hit["memory"]["subject"] == "user"
+        assert hit["memory"]["source_turn_ids"] == ["message-0"]
 
 
 async def test_forget(mcp_server: ModuleType):

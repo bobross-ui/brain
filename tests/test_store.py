@@ -3,7 +3,7 @@ from datetime import datetime
 import pytest
 
 from brain.embeddings import SentenceTransformerEmbedder
-from brain.models import Memory, Scope
+from brain.models import Memory, Scope, SessionInput, Turn
 
 
 def _assert_iso8601(value: str) -> None:
@@ -92,6 +92,69 @@ async def test_update(store):
 
     fetched = await store.get(memory.id, scope)
     assert fetched == updated
+
+
+async def test_add_and_update_provenance(store):
+    scope = Scope(user_id="alice")
+    first_session = await store.ingest_session_turns(
+        SessionInput(
+            source_session_id="session_1",
+            turns=[
+                Turn(
+                    speaker="Alice",
+                    text="I like pasta.",
+                    source_turn_id="D1:1",
+                )
+            ],
+        ),
+        scope,
+    )
+    second_session = await store.ingest_session_turns(
+        SessionInput(
+            source_session_id="session_2",
+            turns=[
+                Turn(
+                    speaker="Alice",
+                    text="I prefer risotto.",
+                    source_turn_id="D2:1",
+                )
+            ],
+        ),
+        scope,
+    )
+
+    memory = await store.add(
+        "Alice likes pasta.",
+        scope,
+        subject="Alice",
+        internal_turn_ids=first_session.turn_ids,
+        observed_at="2026-06-01T00:00:00+00:00",
+        source_session_id="session_1",
+    )
+    assert memory.subject == "Alice"
+    assert memory.source_turn_ids == ["D1:1"]
+    assert memory.source_session_id == "session_1"
+
+    updated = await store.update(
+        memory.id,
+        "Alice prefers risotto.",
+        scope,
+        internal_turn_ids=second_session.turn_ids,
+        observed_at="2026-06-02T00:00:00+00:00",
+        source_session_id="session_2",
+    )
+    assert updated is not None
+    assert updated.source_turn_ids == ["D2:1"]
+    assert updated.source_session_id == "session_2"
+    assert updated.observed_at == "2026-06-02T00:00:00+00:00"
+
+    without_new_sources = await store.update(
+        memory.id,
+        "Alice still prefers risotto.",
+        scope,
+    )
+    assert without_new_sources is not None
+    assert without_new_sources.source_turn_ids == ["D2:1"]
 
 
 async def test_namespace_isolation(store):
