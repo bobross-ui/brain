@@ -80,9 +80,14 @@ def test_apply_migrations_to_empty_db_sets_latest_version(tmp_path: Path) -> Non
         memory_columns = {
             row["name"] for row in db.execute("PRAGMA table_info(memories)").fetchall()
         }
-        assert {"subject", "source_session_id", "observed_at"}.issubset(
-            memory_columns
-        )
+        assert {
+            "subject",
+            "source_session_id",
+            "observed_at",
+            "event_date",
+            "event_date_start",
+            "event_date_end",
+        }.issubset(memory_columns)
     finally:
         db.close()
 

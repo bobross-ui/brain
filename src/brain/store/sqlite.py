@@ -206,6 +206,9 @@ def _memory_select_columns(alias: str = "memories") -> str:
         {alias}.subject,
         {alias}.source_session_id,
         {alias}.observed_at,
+        {alias}.event_date,
+        {alias}.event_date_start,
+        {alias}.event_date_end,
         {alias}.content_hash,
         {alias}.created_at,
         {alias}.updated_at,
@@ -237,6 +240,9 @@ def _row_to_memory(row: sqlite3.Row | dict[str, Any]) -> Memory:
         source_turn_ids=json.loads(row["source_turn_ids"]),
         source_session_id=row["source_session_id"],
         observed_at=row["observed_at"],
+        event_date=row["event_date"],
+        event_date_start=row["event_date_start"],
+        event_date_end=row["event_date_end"],
         content_hash=row["content_hash"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -282,6 +288,9 @@ class SQLiteMemoryStore(MemoryStore):
         internal_turn_ids: list[str] | None = None,
         observed_at: str | None = None,
         source_session_id: str | None = None,
+        event_date: str | None = None,
+        event_date_start: str | None = None,
+        event_date_end: str | None = None,
     ) -> Memory:
         embedding = await self._embedder.embed(content)
         memory_id = str(uuid.uuid4())
@@ -297,10 +306,11 @@ class SQLiteMemoryStore(MemoryStore):
                     """
                     INSERT INTO memories (
                         id, content, user_id, agent_id, namespace, metadata,
-                        subject, source_session_id, observed_at, content_hash,
-                        created_at, updated_at
+                        subject, source_session_id, observed_at, event_date,
+                        event_date_start, event_date_end, content_hash, created_at,
+                        updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         memory_id,
@@ -312,6 +322,9 @@ class SQLiteMemoryStore(MemoryStore):
                         subject,
                         source_session_id,
                         observed_at,
+                        event_date,
+                        event_date_start,
+                        event_date_end,
                         content_hash,
                         now,
                         now,
@@ -508,6 +521,17 @@ class SQLiteMemoryStore(MemoryStore):
                 "internal_turn_ids": action.internal_turn_ids,
                 "source_session_id": action.source_session_id,
                 "observed_at": action.observed_at,
+                "event_date": action.event_date,
+                "event_date_start": action.event_date_start,
+                "event_date_end": action.event_date_end,
+                "temporal_provided": any(
+                    value is not None
+                    for value in (
+                        action.event_date,
+                        action.event_date_start,
+                        action.event_date_end,
+                    )
+                ),
                 "embedding": None,
                 "id": str(uuid.uuid4()),
                 "created_at": now,
@@ -564,10 +588,11 @@ class SQLiteMemoryStore(MemoryStore):
                             """
                             INSERT INTO memories (
                                 id, content, user_id, agent_id, namespace, metadata,
-                                subject, source_session_id, observed_at, content_hash,
+                                subject, source_session_id, observed_at, event_date,
+                                event_date_start, event_date_end, content_hash,
                                 created_at, updated_at
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 prepared["id"],
@@ -579,6 +604,9 @@ class SQLiteMemoryStore(MemoryStore):
                                 prepared["subject"],
                                 prepared["source_session_id"],
                                 prepared["observed_at"],
+                                prepared["event_date"],
+                                prepared["event_date_start"],
+                                prepared["event_date_end"],
                                 prepared["content_hash"],
                                 prepared["created_at"],
                                 prepared["updated_at"],
@@ -656,6 +684,13 @@ class SQLiteMemoryStore(MemoryStore):
                                 subject = COALESCE(?, subject),
                                 source_session_id = COALESCE(?, source_session_id),
                                 observed_at = COALESCE(?, observed_at),
+                                event_date = CASE WHEN ? THEN ? ELSE event_date END,
+                                event_date_start = CASE
+                                    WHEN ? THEN ? ELSE event_date_start
+                                END,
+                                event_date_end = CASE
+                                    WHEN ? THEN ? ELSE event_date_end
+                                END,
                                 content_hash = ?,
                                 updated_at = ?
                             WHERE rowid = ?
@@ -666,6 +701,12 @@ class SQLiteMemoryStore(MemoryStore):
                                 prepared["subject"],
                                 prepared["source_session_id"],
                                 prepared["observed_at"],
+                                prepared["temporal_provided"],
+                                prepared["event_date"],
+                                prepared["temporal_provided"],
+                                prepared["event_date_start"],
+                                prepared["temporal_provided"],
+                                prepared["event_date_end"],
                                 prepared["content_hash"],
                                 prepared["updated_at"],
                                 rowid,
@@ -835,17 +876,43 @@ class SQLiteMemoryStore(MemoryStore):
                     }
 
                 placeholders = ",".join("?" for _ in candidate_rowids)
-                subject_clause = ""
+                filter_clauses: list[str] = []
                 parameters: list[Any] = list(candidate_rowids)
                 if filter_spec.subject is not None:
-                    subject_clause = "AND memories.subject = ? COLLATE NOCASE"
+                    filter_clauses.append(
+                        "memories.subject = ? COLLATE NOCASE"
+                    )
                     parameters.append(filter_spec.subject)
+                event_start = (
+                    "COALESCE(memories.event_date_start, memories.event_date)"
+                )
+                event_end = (
+                    "COALESCE(memories.event_date_end, memories.event_date)"
+                )
+                if filter_spec.event_on is not None:
+                    filter_clauses.extend(
+                        [f"{event_start} <= ?", f"{event_end} >= ?"]
+                    )
+                    parameters.extend(
+                        [filter_spec.event_on, filter_spec.event_on]
+                    )
+                if filter_spec.event_after is not None:
+                    filter_clauses.append(f"{event_end} >= ?")
+                    parameters.append(filter_spec.event_after)
+                if filter_spec.event_before is not None:
+                    filter_clauses.append(f"{event_start} <= ?")
+                    parameters.append(filter_spec.event_before)
+                filter_sql = (
+                    "AND " + " AND ".join(filter_clauses)
+                    if filter_clauses
+                    else ""
+                )
                 rows = db.execute(
                     f"""
                     SELECT memories.rowid, {_memory_select_columns("memories")}
                     FROM memories
                     WHERE memories.rowid IN ({placeholders})
-                      {subject_clause}
+                      {filter_sql}
                     """,
                     tuple(parameters),
                 ).fetchall()
@@ -1063,6 +1130,9 @@ class SQLiteMemoryStore(MemoryStore):
         subject: str | None = None,
         observed_at: str | None = None,
         source_session_id: str | None = None,
+        event_date: str | None = None,
+        event_date_start: str | None = None,
+        event_date_end: str | None = None,
     ) -> Memory | None:
         existing = await self.get(id, scope)
         if existing is None:
@@ -1071,6 +1141,10 @@ class SQLiteMemoryStore(MemoryStore):
         embedding = await self._embedder.embed(content)
         content_hash = _content_hash(content)
         updated_at = _utc_now()
+        temporal_provided = any(
+            value is not None
+            for value in (event_date, event_date_start, event_date_end)
+        )
 
         def _work() -> dict[str, Any] | None:
             db = _open_db(self._db_path)
@@ -1103,6 +1177,13 @@ class SQLiteMemoryStore(MemoryStore):
                         subject = COALESCE(?, subject),
                         source_session_id = COALESCE(?, source_session_id),
                         observed_at = COALESCE(?, observed_at),
+                        event_date = CASE WHEN ? THEN ? ELSE event_date END,
+                        event_date_start = CASE
+                            WHEN ? THEN ? ELSE event_date_start
+                        END,
+                        event_date_end = CASE
+                            WHEN ? THEN ? ELSE event_date_end
+                        END,
                         content_hash = ?,
                         updated_at = ?
                     WHERE rowid = ?
@@ -1112,6 +1193,12 @@ class SQLiteMemoryStore(MemoryStore):
                         subject,
                         source_session_id,
                         observed_at,
+                        temporal_provided,
+                        event_date,
+                        temporal_provided,
+                        event_date_start,
+                        temporal_provided,
+                        event_date_end,
                         content_hash,
                         updated_at,
                         rowid,

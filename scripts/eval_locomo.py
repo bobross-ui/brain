@@ -45,6 +45,7 @@ from brain.config import settings
 from brain.llm import LLMClient, build_llm_client
 from brain.memory import build_memory
 from brain.models import RetrievedEvidence, Scope, ScoredMemory, SessionInput, Turn
+from brain.temporal import query_date_filters
 
 
 # Best-effort; confirm against the LOCOMO dataset/repo before citing per-category numbers.
@@ -219,7 +220,8 @@ async def answer_question(
     retrieved: list[RetrievedEvidence],
 ) -> str:
     evidence = "\n".join(
-        f"{index}. {item.content}" for index, item in enumerate(retrieved)
+        f"{index}. {_format_evidence(item)}"
+        for index, item in enumerate(retrieved)
     ) or "(no evidence retrieved)"
     messages = [
         {"role": "system", "content": ANSWER_SYSTEM},
@@ -230,6 +232,17 @@ async def answer_question(
     ]
     result = await llm.chat_json(messages, ANSWER_SCHEMA, temperature=0.0)
     return str(result.get("answer", "")).strip()
+
+
+def _format_evidence(item: RetrievedEvidence) -> str:
+    if item.event_date is not None:
+        return f"[{item.event_date}] {item.content}"
+    if item.event_date_start is not None and item.event_date_end is not None:
+        return (
+            f"[{item.event_date_start} to {item.event_date_end}] "
+            f"{item.content}"
+        )
+    return item.content
 
 
 async def judge_answer(llm: LLMClient, question: str, gold: str, prediction: str) -> bool:
@@ -314,6 +327,9 @@ def _as_retrieved_evidence(
                 source_turn_ids=memory.source_turn_ids,
                 source_session_id=memory.source_session_id,
                 observed_at=memory.observed_at,
+                event_date=getattr(memory, "event_date", None),
+                event_date_start=getattr(memory, "event_date_start", None),
+                event_date_end=getattr(memory, "event_date_end", None),
             )
         )
     return evidence
@@ -493,11 +509,20 @@ async def run(args: argparse.Namespace) -> None:
                         }
                     )
                 else:
-                    retrieved = await service.recall_evidence(
-                        question,
-                        scope,
-                        limit=args.k,
-                    )
+                    date_filters = query_date_filters(question)
+                    if date_filters:
+                        retrieved = await service.recall_evidence(
+                            question,
+                            scope,
+                            limit=args.k,
+                            filters=date_filters,
+                        )
+                    else:
+                        retrieved = await service.recall_evidence(
+                            question,
+                            scope,
+                            limit=args.k,
+                        )
                     prediction = await answer_question(answerer, question, retrieved)
 
                     if judge is not None:

@@ -30,6 +30,7 @@ from brain.retrieval import (
 )
 from brain.store.base import MemoryStore
 from brain.store.sqlite import SQLiteMemoryStore, _apply_schema
+from brain.temporal import resolve
 
 
 RECONCILE_SCORE_THRESHOLD = 0.3
@@ -165,6 +166,15 @@ class MemoryService:
         metadata = dict(candidate.metadata)
         metadata.update(action.metadata)
         metadata["unresolved_source_turn_ids"] = unresolved_count
+        time_ref = resolve(candidate.content, observed_at)
+        if time_ref is not None:
+            metadata.update(
+                {
+                    "raw_time_phrase": time_ref.raw_phrase,
+                    "temporal_anchor": time_ref.anchor,
+                    "temporal_method": time_ref.method,
+                }
+            )
         if action.kind == MemoryActionKind.ADD and not internal_turn_ids:
             metadata["unsourced"] = True
         elif action.kind == MemoryActionKind.UPDATE and not internal_turn_ids:
@@ -181,6 +191,11 @@ class MemoryService:
                 "internal_turn_ids": action_internal_turn_ids,
                 "source_session_id": source_session_id,
                 "observed_at": observed_at,
+                "event_date": time_ref.date if time_ref is not None else None,
+                "event_date_start": (
+                    time_ref.start if time_ref is not None else None
+                ),
+                "event_date_end": time_ref.end if time_ref is not None else None,
             }
         )
 
@@ -329,6 +344,9 @@ class MemoryService:
                 source_turn_ids=hit.memory.source_turn_ids,
                 source_session_id=hit.memory.source_session_id,
                 observed_at=hit.memory.observed_at,
+                event_date=hit.memory.event_date,
+                event_date_start=hit.memory.event_date_start,
+                event_date_end=hit.memory.event_date_end,
             )
             for hit in memory_hits
         ]

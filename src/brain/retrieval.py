@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+from datetime import date
 from typing import Protocol, Sequence, TypeVar
 
 
@@ -18,21 +19,51 @@ T = TypeVar("T")
 @dataclass(frozen=True)
 class FilterSpec:
     subject: str | None = None
+    event_after: str | None = None
+    event_before: str | None = None
+    event_on: str | None = None
 
     @classmethod
     def from_dict(cls, filters: dict | None) -> "FilterSpec":
         if not filters:
             return cls()
 
-        unsupported = set(filters) - {"subject"}
+        unsupported = set(filters) - {
+            "subject",
+            "event_after",
+            "event_before",
+            "event_on",
+        }
         if unsupported:
             names = ", ".join(sorted(unsupported))
             raise ValueError(f"Unsupported memory filters: {names}")
-        return cls(subject=filters.get("subject"))
+        for name in ("event_after", "event_before", "event_on"):
+            value = filters.get(name)
+            if value is not None:
+                try:
+                    date.fromisoformat(str(value))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Memory filter {name} must be an ISO-8601 date"
+                    ) from exc
+        return cls(
+            subject=filters.get("subject"),
+            event_after=filters.get("event_after"),
+            event_before=filters.get("event_before"),
+            event_on=filters.get("event_on"),
+        )
 
     @property
     def active(self) -> bool:
-        return self.subject is not None
+        return any(
+            value is not None
+            for value in (
+                self.subject,
+                self.event_after,
+                self.event_before,
+                self.event_on,
+            )
+        )
 
 
 def candidate_limit(limit: int, *, overfetch: bool) -> int:

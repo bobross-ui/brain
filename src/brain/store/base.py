@@ -24,6 +24,9 @@ class MemoryStore(ABC):
         internal_turn_ids: list[str] | None = None,
         observed_at: str | None = None,
         source_session_id: str | None = None,
+        event_date: str | None = None,
+        event_date_start: str | None = None,
+        event_date_end: str | None = None,
     ) -> Memory:
         ...
 
@@ -58,6 +61,9 @@ class MemoryStore(ABC):
         subject: str | None = None,
         observed_at: str | None = None,
         source_session_id: str | None = None,
+        event_date: str | None = None,
+        event_date_start: str | None = None,
+        event_date_end: str | None = None,
     ) -> Memory | None:
         ...
 

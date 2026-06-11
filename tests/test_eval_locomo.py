@@ -23,7 +23,7 @@ class _RecordingService:
     async def search(self, query, scope, limit):
         return []
 
-    async def recall_evidence(self, query, scope, limit):
+    async def recall_evidence(self, query, scope, limit, *, filters=None):
         return []
 
     async def search_turns(self, query, scope, limit):
@@ -117,6 +117,45 @@ async def test_answer_question_consumes_retrieved_evidence():
 
     assert answer == "Berlin"
     assert "Evidence:\n0. Alice moved to Berlin." in llm.messages[1]["content"]
+
+
+async def test_answer_question_renders_normalized_event_date():
+    llm = _AnswerLLM()
+    retrieved = [
+        RetrievedEvidence(
+            kind="memory",
+            content="Caroline attended a support group yesterday.",
+            score=1.0,
+            memory_id="memory-1",
+            event_date="2023-05-07",
+        )
+    ]
+
+    await eval_locomo.answer_question(
+        llm,
+        "When did Caroline attend the support group?",
+        retrieved,
+    )
+
+    assert (
+        "0. [2023-05-07] Caroline attended a support group yesterday."
+        in llm.messages[1]["content"]
+    )
+
+
+def test_query_date_filters_parse_absolute_dates_only():
+    assert eval_locomo.query_date_filters(
+        "What did Caroline do on May 7 2023?"
+    ) == {"event_on": "2023-05-07"}
+    assert eval_locomo.query_date_filters(
+        "What did Caroline do before May 2023?"
+    ) == {"event_before": "2023-05-01"}
+    assert eval_locomo.query_date_filters(
+        "What did Caroline do last week?"
+    ) == {}
+    assert eval_locomo.query_date_filters(
+        "What activity did Caroline enjoy?"
+    ) == {}
 
 
 def test_evidence_recall_scores_full_partial_and_missing_evidence():

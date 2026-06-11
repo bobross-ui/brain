@@ -6,8 +6,9 @@ SYSTEM_PROMPT = (
     "You are a memory extraction assistant. Given a conversation between named speakers, "
     "extract all distinct atomic facts worth remembering. Each fact must be a single, "
     "self-contained statement that names the person or entity it is about. Cite only the "
-    "provided turn IDs that directly support the fact. Output only JSON matching the "
-    "provided schema."
+    "provided turn IDs that directly support the fact. Preserve relative time phrases "
+    "such as 'yesterday' or 'last week' verbatim in the fact content. Output only JSON "
+    "matching the provided schema."
 )
 
 USER_PROMPT_TEMPLATE = (

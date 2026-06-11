@@ -21,6 +21,9 @@ class Memory(BaseModel):
     source_turn_ids: list[str] = Field(default_factory=list)
     source_session_id: str | None = None
     observed_at: str | None = None
+    event_date: str | None = None
+    event_date_start: str | None = None
+    event_date_end: str | None = None
     content_hash: str
     created_at: str
     updated_at: str
@@ -101,6 +104,9 @@ class MemoryAction(BaseModel):
     internal_turn_ids: list[str] | None = None
     source_session_id: str | None = None
     observed_at: str | None = None
+    event_date: str | None = None
+    event_date_start: str | None = None
+    event_date_end: str | None = None
 
 
 class Reconciler(ABC):
