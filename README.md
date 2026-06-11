@@ -80,8 +80,8 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 No API keys are required for the default local (Ollama) backend.
 
 `BRAIN_RERANKER_MODEL` is optional and disabled by default. Set it to a local
-sentence-transformers cross-encoder model to rerank the fused candidate pool. The model is loaded
-on first use and may be downloaded by sentence-transformers.
+sentence-transformers cross-encoder model to rerank the top fused candidates (capped at 50 per
+query). The model is loaded on first use and may be downloaded by sentence-transformers.
 
 ## LLM Backends
 

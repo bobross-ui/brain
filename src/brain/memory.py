@@ -21,9 +21,10 @@ from brain.models import (
 )
 from brain.reconcile import LLMReconciler
 from brain.retrieval import (
+    RERANK_DEPTH,
     CrossEncoderReranker,
     Reranker,
-    candidate_limit,
+    fusion_limit,
     reciprocal_rank_fusion,
     rerank,
 )
@@ -275,9 +276,8 @@ class MemoryService:
         if limit <= 0:
             return []
 
-        store_limit = candidate_limit(
-            limit,
-            overfetch=self._reranker is not None,
+        store_limit = (
+            max(limit, RERANK_DEPTH) if self._reranker is not None else limit
         )
         results = await self._store.search(
             query,
@@ -291,6 +291,7 @@ class MemoryService:
             results,
             [item.memory.content for item in results],
             self._reranker,
+            depth=store_limit,
         )
         if reranked is None:
             return results[:limit]
@@ -310,7 +311,7 @@ class MemoryService:
         if limit <= 0:
             return []
 
-        pool_limit = candidate_limit(limit, overfetch=True)
+        pool_limit = fusion_limit(limit)
         memory_hits = await self._store.search(
             query,
             scope,
@@ -370,6 +371,7 @@ class MemoryService:
             fused,
             [item.content for item in fused],
             self._reranker,
+            depth=max(limit, RERANK_DEPTH),
         )
         if reranked is None:
             return fused[:limit]

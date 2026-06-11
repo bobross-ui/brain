@@ -17,6 +17,7 @@ from brain.models import (
     Turn,
 )
 from brain.reconcile import AlwaysAddReconciler
+from brain.retrieval import RERANK_DEPTH, rerank, search_pool_limit
 from brain.store.sqlite import SQLiteMemoryStore
 
 
@@ -348,3 +349,44 @@ async def test_optional_reranker_reorders_hybrid_candidates(store):
 
     assert results[0].memory.id == preferred.id
     assert results[0].score == 10.0
+
+
+def test_search_pool_limit_routes_by_filters_and_mode():
+    assert search_pool_limit(10, filters_active=True, mode="vector") == 200
+    assert search_pool_limit(10, filters_active=True, mode="hybrid") == 200
+    assert search_pool_limit(10, filters_active=False, mode="hybrid") == 50
+    assert search_pool_limit(60, filters_active=False, mode="hybrid") == 300
+    assert search_pool_limit(10, filters_active=False, mode="vector") == 10
+    assert search_pool_limit(10, filters_active=False, mode="bm25") == 10
+
+
+async def test_rerank_caps_documents_at_depth():
+    class CountingReranker:
+        def __init__(self):
+            self.batch_sizes: list[int] = []
+
+        async def score(
+            self,
+            query: str,
+            documents: Sequence[str],
+        ) -> list[float]:
+            self.batch_sizes.append(len(documents))
+            return [0.0] * len(documents)
+
+    reranker = CountingReranker()
+    items = [f"item-{index}" for index in range(RERANK_DEPTH + 30)]
+
+    ranked = await rerank("query", items, items, reranker)
+
+    assert reranker.batch_sizes == [RERANK_DEPTH]
+    assert len(ranked) == RERANK_DEPTH
+
+    deeper = await rerank(
+        "query",
+        items,
+        items,
+        reranker,
+        depth=len(items),
+    )
+    assert reranker.batch_sizes == [RERANK_DEPTH, len(items)]
+    assert len(deeper) == len(items)

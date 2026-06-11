@@ -24,8 +24,8 @@ from brain.models import (
 )
 from brain.retrieval import (
     FilterSpec,
-    candidate_limit,
     reciprocal_rank_fusion,
+    search_pool_limit,
 )
 from brain.store.base import MemoryStore
 
@@ -763,12 +763,10 @@ class SQLiteMemoryStore(MemoryStore):
             raise ValueError(f"Unsupported search mode: {mode}")
 
         filter_spec = FilterSpec.from_dict(filters)
-        pool_limit = candidate_limit(
+        pool_limit = search_pool_limit(
             limit,
-            overfetch=(
-                filter_spec.active
-                or mode == "hybrid"
-            ),
+            filters_active=filter_spec.active,
+            mode=mode,
         )
         query_embedding = None
         if mode in {"hybrid", "vector"}:

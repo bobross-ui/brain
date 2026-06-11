@@ -6,6 +6,11 @@ from typing import Protocol, Sequence, TypeVar
 RRF_K = 60
 FILTER_OVERFETCH_MIN = 200
 FILTER_OVERFETCH_MULTIPLIER = 10
+# Fusion only needs enough list depth for the retrievers to overlap; past ~50
+# the RRF contribution (1/(RRF_K + rank)) is too small to move the top-k.
+FUSION_DEPTH_MIN = 50
+FUSION_DEPTH_MULTIPLIER = 5
+RERANK_DEPTH = 50
 
 T = TypeVar("T")
 
@@ -34,6 +39,24 @@ def candidate_limit(limit: int, *, overfetch: bool) -> int:
     if not overfetch:
         return limit
     return max(FILTER_OVERFETCH_MIN, FILTER_OVERFETCH_MULTIPLIER * limit)
+
+
+def fusion_limit(limit: int) -> int:
+    return max(FUSION_DEPTH_MIN, FUSION_DEPTH_MULTIPLIER * limit)
+
+
+def search_pool_limit(limit: int, *, filters_active: bool, mode: str) -> int:
+    """Per-retriever candidate depth for store search.
+
+    Non-partition filters need the deep pool (the matching row may rank far
+    below the unfiltered top-k); plain hybrid fusion only needs overlap depth;
+    single-retriever modes need no extra candidates at all.
+    """
+    if filters_active:
+        return candidate_limit(limit, overfetch=True)
+    if mode == "hybrid":
+        return fusion_limit(limit)
+    return limit
 
 
 def reciprocal_rank_fusion(
@@ -84,9 +107,13 @@ async def rerank(
     items: Sequence[T],
     documents: Sequence[str],
     reranker: Reranker | None,
+    *,
+    depth: int = RERANK_DEPTH,
 ) -> list[tuple[T, float]] | None:
     if reranker is None or not items:
         return None
+    items = list(items)[:depth]
+    documents = list(documents)[:depth]
     scores = await reranker.score(query, documents)
     if len(scores) != len(items):
         raise RuntimeError("Reranker returned an unexpected number of scores")
