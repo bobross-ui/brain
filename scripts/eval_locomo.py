@@ -367,6 +367,27 @@ def heuristic_correct(gold: str, prediction: str) -> bool | None:
     return len(gold_tokens & _content_tokens(prediction)) / len(gold_tokens) >= 0.6
 
 
+async def score_prediction(
+    category: str,
+    question: str,
+    gold: str,
+    prediction: str,
+    judge: LLMClient | None,
+) -> tuple[bool | None, bool]:
+    """Score a prediction, returning (correct, judged).
+
+    Adversarial (category 5) items carry no gold answer — `_gold_answer` falls back
+    to `adversarial_answer`, which is the trap a fooled system would give. Judging
+    against it inverts the score, so the correct behavior is abstention and no LLM
+    judge runs for these items.
+    """
+    if category == "adversarial":
+        return _is_abstention(prediction), False
+    if judge is not None:
+        return await judge_answer(judge, question, gold, prediction), True
+    return heuristic_correct(gold, prediction), False
+
+
 def _mean(values: list[bool | float | None]) -> float | None:
     scored = [float(value) for value in values if value is not None]
     return sum(scored) / len(scored) if scored else None
@@ -525,10 +546,13 @@ async def run(args: argparse.Namespace) -> None:
                         )
                     prediction = await answer_question(answerer, question, retrieved)
 
-                    if judge is not None:
-                        correct = await judge_answer(judge, question, gold, prediction)
-                    else:
-                        correct = heuristic_correct(gold, prediction)
+                    correct, was_judged = await score_prediction(
+                        category,
+                        question,
+                        gold,
+                        prediction,
+                        judge,
+                    )
 
                     records.append(
                         {
@@ -541,7 +565,7 @@ async def run(args: argparse.Namespace) -> None:
                             **_evidence_fields(gold_evidence, retrieved),
                             "recall_hit": recall_at_k(gold, retrieved),
                             "correct": correct,
-                            "judged": judge is not None,
+                            "judged": was_judged,
                         }
                     )
     finally:

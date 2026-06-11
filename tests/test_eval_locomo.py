@@ -208,6 +208,65 @@ def test_heuristic_correct():
     assert eval_locomo.heuristic_correct("Not mentioned", "She likes jazz") is False
 
 
+class _RaisingJudge:
+    async def chat_json(self, messages, schema, temperature=0.0):
+        raise AssertionError("judge must not run for adversarial items")
+
+
+class _VerdictJudge:
+    def __init__(self, verdict: bool):
+        self._verdict = verdict
+
+    async def chat_json(self, messages, schema, temperature=0.0):
+        return {"correct": self._verdict}
+
+
+async def test_score_prediction_adversarial_scores_abstention_not_trap():
+    # gold here is the trap `adversarial_answer`; abstaining is the correct behavior
+    correct, judged = await eval_locomo.score_prediction(
+        "adversarial",
+        "What did Caroline realize after her charity race?",
+        "self-care is important",
+        "No information available",
+        _RaisingJudge(),
+    )
+    assert correct is True
+    assert judged is False
+
+    # a fooled answerer that produces the trap answer scores wrong
+    correct, judged = await eval_locomo.score_prediction(
+        "adversarial",
+        "What did Caroline realize after her charity race?",
+        "self-care is important",
+        "She realized self-care is important",
+        _RaisingJudge(),
+    )
+    assert correct is False
+    assert judged is False
+
+
+async def test_score_prediction_non_adversarial_uses_judge_then_heuristic():
+    correct, judged = await eval_locomo.score_prediction(
+        "single_hop",
+        "Where did Alice move?",
+        "Berlin",
+        "Tokyo",
+        _VerdictJudge(False),
+    )
+    assert correct is False
+    assert judged is True
+
+    correct, judged = await eval_locomo.score_prediction(
+        "single_hop",
+        "Where did Alice move?",
+        "Berlin",
+        "She moved to Berlin",
+        None,
+    )
+    assert correct is True
+    assert judged is False
+
+
 def test_as_bool_coerces_unenforced_schema_values():
     # real booleans (ollama enforces the schema)
     assert eval_locomo._as_bool(True) is True
